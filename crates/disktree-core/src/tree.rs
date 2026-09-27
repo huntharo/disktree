@@ -75,6 +75,8 @@ pub struct Node {
     /// `(device, inode)` for files, used to de-duplicate hardlinks. No file
     /// has inode zero, which lets `None` cost nothing.
     pub inode: Option<(u64, NonZeroU64)>,
+    pub clone_info: Option<Box<crate::sharing::CloneInfo>>,
+    pub sharing: Option<Box<crate::sharing::Sharing>>,
     /// The directory could not be read; its contents are unknown.
     pub read_error: bool,
     /// Newest write time at or beneath this node, in Unix seconds; `0` when
@@ -103,6 +105,8 @@ impl Node {
             files: 0,
             dirs: 1,
             inode: None,
+            clone_info: None,
+            sharing: None,
             read_error: false,
             modified: 0,
             category: Category::Other,
@@ -124,12 +128,19 @@ impl Node {
             files: u64::from(kind == NodeKind::File),
             dirs: 0,
             inode: None,
+            clone_info: None,
+            sharing: None,
             read_error: false,
             modified: 0,
             category: Category::Other,
             reclaim: None,
             children: Vec::new(),
         }
+    }
+
+    /// Sparse: ordinary files do not pay for five additional byte counters.
+    pub fn sharing(&self) -> crate::sharing::Sharing {
+        self.sharing.as_deref().copied().unwrap_or_default()
     }
 
     pub const fn is_dir(&self) -> bool {
@@ -265,6 +276,7 @@ impl Node {
 /// it follows without a second pass.
 pub fn aggregate(node: &mut Node, metric: Metric) {
     aggregate_at(node, metric, 0, None);
+    crate::sharing::refresh(node);
 }
 
 /// [`aggregate`], charging a hardlinked file once: a leaf whose identity
@@ -273,6 +285,7 @@ pub fn aggregate(node: &mut Node, metric: Metric) {
 /// can split it differently between folders; the totals are the same.
 pub(crate) fn aggregate_deduped(node: &mut Node, metric: Metric, seen: &Seen) {
     aggregate_at(node, metric, 0, Some(seen));
+    crate::sharing::refresh(node);
 }
 
 /// Identities a finish pass has met.
@@ -432,7 +445,8 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn a_node_stays_small() {
-        assert_eq!(size_of::<Node>(), 88);
+        // Two optional pointers keep clone data sparse on ordinary nodes.
+        assert_eq!(size_of::<Node>(), 104);
     }
 
     #[test]

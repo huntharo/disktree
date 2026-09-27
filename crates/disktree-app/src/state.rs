@@ -1767,7 +1767,14 @@ impl Disktree {
 
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
-        plan(self.marks.items(), &self.root_path)
+        let mut plan = plan(self.marks.items(), &self.root_path);
+        if let Some(tree) = self.tree() {
+            plan.estimate_reclaim(|target| {
+                crate::marks::find(&self.root_path, tree, &target.path)
+                    .map(|node| node.sharing().reclaimable(node.bytes))
+            });
+        }
+        plan
     }
 
     // ── layout and hit-testing ──────────────────────────────────────────
