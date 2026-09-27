@@ -15,7 +15,7 @@
 //! poll without locking, and cooperative cancellation so a re-scan can abandon
 //! a walk of a large home directory instead of queueing behind it.
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(all(not(windows), any(test, not(target_os = "macos"))))]
 use std::fs::DirEntry;
 use std::fs::{self, Metadata};
 use std::io;
@@ -495,12 +495,10 @@ impl WalkContext {
 
 /// What the walk reads about one directory entry.
 ///
-/// `std::fs::DirEntry` everywhere but Windows and macOS. On Windows the
-/// standard listing has neither the allocated size nor a file id, so
-/// measuring like `du` would cost an open per file; [`crate::windows`] lists
-/// a directory with both instead. On macOS it would cost an `lstat` per
-/// entry, and [`crate::macos`] lists a directory with everything a stat
-/// says.
+/// Native bulk metadata on macOS and Windows, `std::fs::DirEntry` elsewhere.
+/// Bulk enumeration avoids a metadata syscall per file on macOS. On Windows
+/// the standard listing lacks allocation and identity; [`crate::windows`]
+/// returns both without opening each file.
 trait Listed {
     /// The entry's path inside `dir`, the directory it was listed from.
     fn entry_path(&self, dir: &Path) -> PathBuf;
@@ -568,15 +566,15 @@ impl Facts {
     }
 }
 
-/// A standard directory entry with its name decoded once, up front.
-#[cfg(not(any(windows, target_os = "macos")))]
-struct Named {
-    entry: DirEntry,
+/// A directory entry with its name decoded once, up front.
+#[cfg(not(windows))]
+struct Named<E> {
+    entry: E,
     name: Box<str>,
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-impl Listed for Named {
+#[cfg(all(not(windows), any(test, not(target_os = "macos"))))]
+impl Listed for Named<DirEntry> {
     fn entry_path(&self, _dir: &Path) -> PathBuf {
         self.entry.path()
     }
@@ -612,50 +610,6 @@ impl Listed for Named {
         self.entry.metadata().map(|meta| Directory {
             device: device_of(&meta),
             evicted: is_dataless(&meta),
-        })
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Listed for crate::macos::Entry {
-    fn entry_path(&self, dir: &Path) -> PathBuf {
-        self.path(dir)
-    }
-
-    fn name(&self) -> &str {
-        self.name()
-    }
-
-    fn take_name(&mut self) -> Box<str> {
-        self.take_name()
-    }
-
-    fn listing(&self) -> io::Result<Listing> {
-        Ok(match self.kind() {
-            crate::macos::Kind::Link => Listing::Symlink,
-            crate::macos::Kind::Directory => Listing::Directory,
-            crate::macos::Kind::File => Listing::Leaf(NodeKind::File),
-            crate::macos::Kind::Other => Listing::Leaf(NodeKind::Other),
-        })
-    }
-
-    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
-        Ok(Facts {
-            size: if apparent_size {
-                self.apparent()
-            } else {
-                self.allocated()
-            },
-            identity: Some(self.identity()),
-            modified: self.modified(),
-            shared: self.shared(),
-        })
-    }
-
-    fn directory(&self) -> io::Result<Directory> {
-        Ok(Directory {
-            device: self.device(),
-            evicted: self.evicted(),
         })
     }
 }
@@ -717,7 +671,7 @@ impl Listed for crate::windows::Entry {
 fn list(
     path: &Path,
     _volume: Option<u64>,
-) -> io::Result<impl Iterator<Item = io::Result<Named>>> {
+) -> io::Result<impl Iterator<Item = io::Result<Named<DirEntry>>>> {
     Ok(fs::read_dir(path)?.map(|entry| {
         entry.map(|entry| Named {
             name: entry.file_name().into_string().map_or_else(
@@ -729,14 +683,6 @@ fn list(
     }))
 }
 
-#[cfg(target_os = "macos")]
-fn list(
-    path: &Path,
-    _volume: Option<u64>,
-) -> io::Result<crate::macos::ReadDir> {
-    crate::macos::read_dir(path)
-}
-
 #[cfg(windows)]
 fn list(
     path: &Path,
@@ -744,6 +690,77 @@ fn list(
 ) -> io::Result<crate::windows::ReadDir> {
     crate::windows::read_dir(path, volume)
 }
+
+#[cfg(target_os = "macos")]
+impl Listed for Named<crate::macos::Entry> {
+    fn entry_path(&self, _dir: &Path) -> PathBuf {
+        self.entry.path()
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn take_name(&mut self) -> Box<str> {
+        std::mem::take(&mut self.name)
+    }
+
+    fn listing(&self) -> io::Result<Listing> {
+        Ok(match self.entry.kind {
+            crate::macos::Kind::Directory => Listing::Directory,
+            crate::macos::Kind::Symlink => Listing::Symlink,
+            crate::macos::Kind::File => Listing::Leaf(NodeKind::File),
+            crate::macos::Kind::Other => Listing::Leaf(NodeKind::Other),
+        })
+    }
+
+    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        let meta = self.entry.metadata().map_err(|error| {
+            error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), error.to_string()),
+                io::Error::from_raw_os_error,
+            )
+        })?;
+        Ok(Facts {
+            size: if apparent_size {
+                meta.apparent
+            } else {
+                meta.allocated
+            },
+            identity: Some((meta.device, meta.inode)),
+            modified: meta.modified,
+            shared: meta.links > 1,
+        })
+    }
+
+    fn directory(&self) -> io::Result<Directory> {
+        // Recheck SF_DATALESS before descent: provider state can change
+        // after enumeration, and listing it could download cloud contents.
+        fs::symlink_metadata(self.entry.path()).map(|meta| Directory {
+            device: device_of(&meta),
+            evicted: is_dataless(&meta),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn list(
+    path: &Path,
+    _volume: Option<u64>,
+) -> io::Result<impl Iterator<Item = io::Result<Named<crate::macos::Entry>>>> {
+    // Only enumeration changes: Rayon still owns directory scheduling and
+    // completion. Request total allocation, without clone queries.
+    Ok(crate::macos::read_dir(path)?.map(|entry| {
+        entry.map(|entry| Named {
+            name: entry.file_name.to_string_lossy().into(),
+            entry,
+        })
+    }))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "scan/macos_tests.rs"]
+mod macos_tests;
 
 /// What a directory entry turned out to be.
 enum Classified {
