@@ -15,7 +15,7 @@
 //! poll without locking, and cooperative cancellation so a re-scan can abandon
 //! a walk of a large home directory instead of queueing behind it.
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), any(test, not(target_os = "macos"))))]
 use std::fs::DirEntry;
 use std::fs::{self, Metadata};
 use std::io;
@@ -468,10 +468,10 @@ impl WalkContext {
 
 /// What the walk reads about one directory entry.
 ///
-/// `std::fs::DirEntry` everywhere but Windows. There the standard listing
-/// has neither the allocated size nor a file id, so measuring like `du`
-/// would cost an open per file; [`crate::windows`] lists a directory with
-/// both instead.
+/// Native bulk metadata on macOS and Windows, `std::fs::DirEntry` elsewhere.
+/// Bulk enumeration avoids a metadata syscall per file on macOS. On Windows
+/// the standard listing lacks allocation and identity; [`crate::windows`]
+/// returns both without opening each file.
 trait Listed {
     /// The entry's path inside `dir`, the directory it was listed from.
     fn entry_path(&self, dir: &Path) -> PathBuf;
@@ -538,15 +538,15 @@ impl Facts {
     }
 }
 
-/// A standard directory entry with its name decoded once, up front.
+/// A directory entry with its name decoded once, up front.
 #[cfg(not(windows))]
-struct Named {
-    entry: DirEntry,
+struct Named<E> {
+    entry: E,
     name: Box<str>,
 }
 
-#[cfg(not(windows))]
-impl Listed for Named {
+#[cfg(all(not(windows), any(test, not(target_os = "macos"))))]
+impl Listed for Named<DirEntry> {
     fn entry_path(&self, _dir: &Path) -> PathBuf {
         self.entry.path()
     }
@@ -639,11 +639,11 @@ impl Listed for crate::windows::Entry {
 }
 
 /// List a directory the way [`Listed`] describes.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn list(
     path: &Path,
     _volume: Option<u64>,
-) -> io::Result<impl Iterator<Item = io::Result<Named>>> {
+) -> io::Result<impl Iterator<Item = io::Result<Named<DirEntry>>>> {
     Ok(fs::read_dir(path)?.map(|entry| {
         entry.map(|entry| Named {
             name: entry.file_name().into_string().map_or_else(
@@ -662,6 +662,96 @@ fn list(
 ) -> io::Result<crate::windows::ReadDir> {
     crate::windows::read_dir(path, volume)
 }
+
+#[cfg(target_os = "macos")]
+impl Listed for Named<dua_core::Entry> {
+    fn entry_path(&self, _dir: &Path) -> PathBuf {
+        self.entry.path()
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn take_name(&mut self) -> Box<str> {
+        std::mem::take(&mut self.name)
+    }
+
+    fn listing(&self) -> io::Result<Listing> {
+        Ok(if self.entry.file_type.is_symlink() {
+            Listing::Symlink
+        } else if self.entry.file_type.is_dir() {
+            Listing::Directory
+        } else if self.entry.file_type.is_file() {
+            Listing::Leaf(NodeKind::File)
+        } else {
+            Listing::Leaf(NodeKind::Other)
+        })
+    }
+
+    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+        let meta = self
+            .entry
+            .metadata
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing native metadata"))?
+            .as_ref()
+            .map_err(|error| {
+                error.raw_os_error().map_or_else(
+                    || io::Error::new(error.kind(), error.to_string()),
+                    io::Error::from_raw_os_error,
+                )
+            })?;
+        Ok(Facts {
+            size: if apparent_size {
+                meta.len()
+            } else {
+                meta.blocks().saturating_mul(512)
+            },
+            identity: Some((meta.dev(), meta.ino())),
+            modified: meta
+                .modified()
+                .ok()
+                .and_then(|time| {
+                    time.duration_since(std::time::UNIX_EPOCH).ok()
+                })
+                .map_or(0, |since| {
+                    i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+                }),
+            shared: meta.nlink() > 1,
+        })
+    }
+
+    fn directory(&self) -> io::Result<Directory> {
+        // Native metadata omits SF_DATALESS. Keep the stat before descent:
+        // enumerating an evicted directory could download cloud contents.
+        fs::symlink_metadata(self.entry.path()).map(|meta| Directory {
+            device: device_of(&meta),
+            evicted: is_dataless(&meta),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn list(
+    path: &Path,
+    _volume: Option<u64>,
+) -> io::Result<impl Iterator<Item = io::Result<Named<dua_core::Entry>>>> {
+    // Only enumeration changes: Rayon still owns directory scheduling and
+    // completion. Defaults request total allocation, without clone queries.
+    Ok(
+        dua_core::read_dir(path, dua_core::Options::default())?.map(|entry| {
+            entry.map(|entry| Named {
+                name: entry.file_name.to_string_lossy().into(),
+                entry,
+            })
+        }),
+    )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "scan/macos_tests.rs"]
+mod macos_tests;
 
 /// What a directory entry turned out to be.
 enum Classified {
