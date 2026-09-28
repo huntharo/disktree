@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::symlink;
 use std::time::{Duration, UNIX_EPOCH};
 
-fn native(path: &Path) -> Vec<Named<dua_core::Entry>> {
+fn native(path: &Path) -> Vec<Named<crate::macos::Entry>> {
     list(path, None)
         .expect("list")
         .map(Result::unwrap)
@@ -20,7 +20,7 @@ fn standard(entry: DirEntry) -> Named<DirEntry> {
     }
 }
 
-fn same_facts(native: &Named<dua_core::Entry>, standard: &Named<DirEntry>) {
+fn same_facts(native: &Named<crate::macos::Entry>, standard: &Named<DirEntry>) {
     assert_eq!(
         native.entry_path(Path::new("")),
         standard.entry_path(Path::new(""))
@@ -125,25 +125,20 @@ fn bulk_timestamps_keep_pre_epoch_semantics() {
 }
 
 #[test]
-fn native_metadata_errors_keep_os_codes_and_missing_is_recoverable() {
+fn native_metadata_errors_keep_os_codes() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("file"), b"data").unwrap();
     let mut entry = native(temp.path()).pop().unwrap();
-    // Inject the dependency's per-entry failure representation, without
+    // Inject a per-entry failure, without
     // depending on the test runner's privileges or racing another thread.
     for code in [rustix::io::Errno::ACCESS, rustix::io::Errno::NOENT] {
         entry.entry.metadata =
-            Some(Err(io::Error::from_raw_os_error(code.raw_os_error())));
+            Err(io::Error::from_raw_os_error(code.raw_os_error()));
         assert_eq!(
             entry.facts(false).err().unwrap().raw_os_error(),
             Some(code.raw_os_error())
         );
     }
-    entry.entry.metadata = None;
-    assert_eq!(
-        entry.facts(false).err().unwrap().kind(),
-        io::ErrorKind::Other
-    );
 }
 
 #[test]

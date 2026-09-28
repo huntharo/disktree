@@ -664,7 +664,7 @@ fn list(
 }
 
 #[cfg(target_os = "macos")]
-impl Listed for Named<dua_core::Entry> {
+impl Listed for Named<crate::macos::Entry> {
     fn entry_path(&self, _dir: &Path) -> PathBuf {
         self.entry.path()
     }
@@ -678,53 +678,36 @@ impl Listed for Named<dua_core::Entry> {
     }
 
     fn listing(&self) -> io::Result<Listing> {
-        Ok(if self.entry.file_type.is_symlink() {
-            Listing::Symlink
-        } else if self.entry.file_type.is_dir() {
-            Listing::Directory
-        } else if self.entry.file_type.is_file() {
-            Listing::Leaf(NodeKind::File)
-        } else {
-            Listing::Leaf(NodeKind::Other)
+        Ok(match self.entry.kind {
+            crate::macos::Kind::Directory => Listing::Directory,
+            crate::macos::Kind::Symlink => Listing::Symlink,
+            crate::macos::Kind::File => Listing::Leaf(NodeKind::File),
+            crate::macos::Kind::Other => Listing::Leaf(NodeKind::Other),
         })
     }
 
     fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
-        let meta = self
-            .entry
-            .metadata
-            .as_ref()
-            .ok_or_else(|| io::Error::other("missing native metadata"))?
-            .as_ref()
-            .map_err(|error| {
-                error.raw_os_error().map_or_else(
-                    || io::Error::new(error.kind(), error.to_string()),
-                    io::Error::from_raw_os_error,
-                )
-            })?;
+        let meta = self.entry.metadata.as_ref().map_err(|error| {
+            error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), error.to_string()),
+                io::Error::from_raw_os_error,
+            )
+        })?;
         Ok(Facts {
             size: if apparent_size {
-                meta.len()
+                meta.apparent
             } else {
-                meta.blocks().saturating_mul(512)
+                meta.allocated
             },
-            identity: Some((meta.dev(), meta.ino())),
-            modified: meta
-                .modified()
-                .ok()
-                .and_then(|time| {
-                    time.duration_since(std::time::UNIX_EPOCH).ok()
-                })
-                .map_or(0, |since| {
-                    i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-                }),
-            shared: meta.nlink() > 1,
+            identity: Some((meta.device, meta.inode)),
+            modified: meta.modified,
+            shared: meta.links > 1,
         })
     }
 
     fn directory(&self) -> io::Result<Directory> {
-        // Native metadata omits SF_DATALESS. Keep the stat before descent:
-        // enumerating an evicted directory could download cloud contents.
+        // Recheck SF_DATALESS before descent: provider state can change
+        // after enumeration, and listing it could download cloud contents.
         fs::symlink_metadata(self.entry.path()).map(|meta| Directory {
             device: device_of(&meta),
             evicted: is_dataless(&meta),
@@ -736,17 +719,15 @@ impl Listed for Named<dua_core::Entry> {
 fn list(
     path: &Path,
     _volume: Option<u64>,
-) -> io::Result<impl Iterator<Item = io::Result<Named<dua_core::Entry>>>> {
+) -> io::Result<impl Iterator<Item = io::Result<Named<crate::macos::Entry>>>> {
     // Only enumeration changes: Rayon still owns directory scheduling and
-    // completion. Defaults request total allocation, without clone queries.
-    Ok(
-        dua_core::read_dir(path, dua_core::Options::default())?.map(|entry| {
-            entry.map(|entry| Named {
-                name: entry.file_name.to_string_lossy().into(),
-                entry,
-            })
-        }),
-    )
+    // completion. Request total allocation, without clone queries.
+    Ok(crate::macos::read_dir(path)?.map(|entry| {
+        entry.map(|entry| Named {
+            name: entry.file_name.to_string_lossy().into(),
+            entry,
+        })
+    }))
 }
 
 #[cfg(all(test, target_os = "macos"))]
