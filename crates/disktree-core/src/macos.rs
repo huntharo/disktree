@@ -8,6 +8,7 @@
     reason = "Darwin's bulk directory call has no std wrapper; the call documents its safety"
 )]
 
+use std::cell::OnceCell;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -93,13 +94,22 @@ impl Metadata {
 pub struct Entry {
     pub file_name: OsString,
     pub kind: Kind,
-    pub metadata: io::Result<Metadata>,
+    pub metadata: OnceCell<io::Result<Metadata>>,
     parent: Arc<Path>,
 }
 
 impl Entry {
     pub fn path(&self) -> PathBuf {
         self.parent.join(&self.file_name)
+    }
+
+    pub fn metadata(&self) -> Result<&Metadata, &io::Error> {
+        self.metadata
+            .get_or_init(|| {
+                fs::symlink_metadata(self.path())
+                    .map(|meta| Metadata::of(&meta))
+            })
+            .as_ref()
     }
 }
 
@@ -232,7 +242,11 @@ impl ReadDir {
 
     fn standard_entry(&self, entry: &fs::DirEntry) -> io::Result<Entry> {
         let kind = Kind::of(entry.file_type()?);
-        let metadata = entry.metadata().map(|meta| Metadata::of(&meta));
+        let metadata = if matches!(kind, Kind::Directory | Kind::Symlink) {
+            OnceCell::new()
+        } else {
+            OnceCell::from(entry.metadata().map(|meta| Metadata::of(&meta)))
+        };
         Ok(Entry {
             file_name: entry.file_name(),
             kind,
@@ -376,20 +390,29 @@ impl Record {
     fn entry(self, parent: Arc<Path>) -> Entry {
         let mut kind = self.kind;
         let metadata = if self.error != 0 {
-            Err(io::Error::from_raw_os_error(self.error))
+            OnceCell::from(Err(io::Error::from_raw_os_error(self.error)))
+        } else if matches!(kind, Kind::Directory | Kind::Symlink)
+            && self.flags.is_some_and(|flags| flags & SF_FIRMLINK == 0)
+        {
+            // The scanner stats directories immediately before descent and
+            // links when deciding whether to follow them. Fetching their
+            // metadata here would repeat that work for every such entry.
+            OnceCell::new()
         } else if kind == Kind::File
             && self.flags.is_some_and(|flags| flags & SF_FIRMLINK == 0)
             && let Some(metadata) = self.metadata
         {
-            Ok(metadata)
+            OnceCell::from(Ok(metadata))
         } else {
             // Bulk metadata describes underlying mount/firmlink entries.
             // A path lookup sees the visible directory; it also supplies
             // missing attributes and metadata for special file types.
-            fs::symlink_metadata(parent.join(&self.name)).map(|meta| {
-                kind = Kind::of(meta.file_type());
-                Metadata::of(&meta)
-            })
+            OnceCell::from(fs::symlink_metadata(parent.join(&self.name)).map(
+                |meta| {
+                    kind = Kind::of(meta.file_type());
+                    Metadata::of(&meta)
+                },
+            ))
         };
         Entry {
             file_name: self.name,

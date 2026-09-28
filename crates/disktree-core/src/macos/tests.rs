@@ -80,7 +80,7 @@ fn missing_attributes_use_stat_without_following_symlinks() {
         let entry = parsed.entry(Arc::from(temp.path()));
         let stat = fs::symlink_metadata(entry.path()).unwrap();
         assert_eq!(entry.kind, Kind::of(stat.file_type()));
-        let metadata = entry.metadata.unwrap();
+        let metadata = entry.metadata().unwrap();
         assert_eq!(metadata.apparent, stat.len());
         assert_eq!(metadata.allocated, stat.blocks() * 512);
         assert_eq!(metadata.inode, stat.ino());
@@ -96,7 +96,7 @@ fn returned_errors_keep_errno_even_when_the_path_exists() {
         .copy_from_slice(&libc::EACCES.to_ne_bytes());
     let entry = Record::parse(&bytes).unwrap().entry(Arc::from(temp.path()));
     assert_eq!(
-        entry.metadata.unwrap_err().raw_os_error(),
+        entry.metadata().unwrap_err().raw_os_error(),
         Some(libc::EACCES)
     );
 }
@@ -158,7 +158,7 @@ fn fallback_lists_entries_but_never_restarts_a_partial_directory() {
         let entries: Vec<_> = reader.map(Result::unwrap).collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file_name, "file");
-        assert_eq!(entries[0].metadata.as_ref().unwrap().apparent, 4);
+        assert_eq!(entries[0].metadata().unwrap().apparent, 4);
 
         let mut reader = read_dir(temp.path()).unwrap();
         reader.started = true;
@@ -189,7 +189,7 @@ fn several_buffers_return_each_name_once() {
     let mut names = BTreeSet::from([first.file_name]);
     for entry in reader.by_ref() {
         let entry = entry.unwrap();
-        assert_eq!(entry.metadata.unwrap().apparent, 4);
+        assert_eq!(entry.metadata().unwrap().apparent, 4);
         assert!(names.insert(entry.file_name), "no duplicate names");
     }
     assert_eq!(names.len(), 1200);
@@ -209,7 +209,7 @@ fn firmlinks_and_missing_flags_use_visible_path_metadata() {
         let entry = parsed.entry(Arc::from(temp.path()));
         assert_eq!(entry.kind, Kind::Directory);
         let stat = fs::symlink_metadata(entry.path()).unwrap();
-        assert_eq!(entry.metadata.unwrap().inode, stat.ino());
+        assert_eq!(entry.metadata().unwrap().inode, stat.ino());
     }
 }
 
@@ -241,7 +241,7 @@ fn readable_directory_without_search_matches_standard_errors() {
     assert_eq!(native.len(), 1);
     assert_eq!(standard.len(), 1);
     assert_eq!(native[0].file_name, standard[0].0);
-    match (&native[0].metadata, &standard[0].1) {
+    match (native[0].metadata(), &standard[0].1) {
         (Err(left), Err(right)) => {
             assert_eq!(left.raw_os_error(), right.raw_os_error());
             assert_eq!(left.raw_os_error(), Some(libc::EACCES));
@@ -249,5 +249,37 @@ fn readable_directory_without_search_matches_standard_errors() {
         // Elevated test runners can still stat through this directory.
         (Ok(left), Ok(right)) => assert_eq!(left.apparent, right.len()),
         _ => panic!("bulk and stat disagree on metadata access"),
+    }
+}
+
+#[test]
+fn directory_and_link_stats_are_deferred_until_needed() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir(root.join("directory")).unwrap();
+    symlink("missing", root.join("link")).unwrap();
+    let entries: Vec<_> = read_dir(root).unwrap().map(Result::unwrap).collect();
+    assert_eq!(entries.len(), 2);
+    for entry in &entries {
+        assert!(
+            entry.metadata.get().is_none(),
+            "enumeration must not stat this entry"
+        );
+    }
+    // No earlier cached stat can hide a directory disappearing before the
+    // consumer requests its metadata. Links still use no-follow metadata.
+    fs::remove_dir(root.join("directory")).unwrap();
+    for entry in entries {
+        if entry.kind == Kind::Directory {
+            assert_eq!(
+                entry.metadata().unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        } else {
+            assert_eq!(entry.kind, Kind::Symlink);
+            assert_eq!(entry.metadata().unwrap().apparent, 7);
+        }
     }
 }

@@ -687,7 +687,7 @@ impl Listed for Named<crate::macos::Entry> {
     }
 
     fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
-        let meta = self.entry.metadata.as_ref().map_err(|error| {
+        let meta = self.entry.metadata().map_err(|error| {
             error.raw_os_error().map_or_else(
                 || io::Error::new(error.kind(), error.to_string()),
                 io::Error::from_raw_os_error,

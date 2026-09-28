@@ -132,8 +132,9 @@ fn native_metadata_errors_keep_os_codes() {
     // Inject a per-entry failure, without
     // depending on the test runner's privileges or racing another thread.
     for code in [rustix::io::Errno::ACCESS, rustix::io::Errno::NOENT] {
-        entry.entry.metadata =
-            Err(io::Error::from_raw_os_error(code.raw_os_error()));
+        entry.entry.metadata = std::cell::OnceCell::from(Err(
+            io::Error::from_raw_os_error(code.raw_os_error()),
+        ));
         assert_eq!(
             entry.facts(false).err().unwrap().raw_os_error(),
             Some(code.raw_os_error())
