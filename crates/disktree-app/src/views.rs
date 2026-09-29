@@ -680,6 +680,7 @@ fn sibling_menu(
         panel = panel.child(
             div()
                 .id(ElementId::Name(format!("sibling-{row_index}").into()))
+                .debug_selector(move || format!("sibling-{row_index}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -687,10 +688,28 @@ fn sibling_menu(
                 .px(space::SM)
                 .py(space::XS)
                 .when(highlighted, |this| this.bg(theme.hover_fill()))
-                .hover(|style| style.bg(theme.hover_fill()))
+                // The pointer moves the one highlight the arrows move, so
+                // two filled rows never compete with the check. Only
+                // entering a row moves it: a pointer resting on one does not
+                // take the highlight back from the arrow keys.
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered && let Some(menu) = this.crumb_menu.as_mut() {
+                        menu.highlighted = row_index;
+                        cx.notify();
+                    }
+                }))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.choose_sibling(&parent, row.index, cx);
                     window.focus(&this.focus, cx);
+                }))
+                // Where you are keeps its check wherever the highlight goes;
+                // bold alone read as losing to the fill under the pointer.
+                .child(div().flex_shrink_0().w(icon::SM).when(current, |this| {
+                    this.debug_selector(|| "sibling-check".into()).child(
+                        gpui_omarchy::icon(gpui_omarchy::IconName::Check)
+                            .size(icon::SM)
+                            .text_color(theme.accent),
+                    )
                 }))
                 .child(
                     div()

@@ -69,8 +69,9 @@ pub mod icon {
 pub mod size {
     use super::Rems;
 
-    /// A crumb's sibling menu.
-    pub const SIBLING_MENU: Rems = Rems(24.0);
+    /// A crumb's sibling menu: a check lane and its gap wider than the
+    /// names alone needed, so they keep the room they had.
+    pub const SIBLING_MENU: Rems = Rems(25.5);
     pub const SIBLING_MENU_HEIGHT: Rems = Rems(32.0);
     /// A list row's share bar.
     pub const ROW_BAR: Rems = Rems(5.5);
