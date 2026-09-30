@@ -1272,7 +1272,7 @@ fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     draw(cx);
     assert!(read(&view, cx, |app| app.crumb_menu.is_some()));
 
-    // The pointer takes the one highlight, and the check stays on where you
+    // The pointer takes the one highlight, and the bar stays on where you
     // are: .cache now, with the pointer on junk.
     let row = |cx: &mut Window, index: usize| {
         cx.debug_bounds(Box::leak(format!("sibling-{index}").into_boxed_str()))
@@ -1286,8 +1286,8 @@ fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
     });
     assert_eq!(highlighted, Some(here), "the highlight follows the pointer");
     let cache_row = row(cx, target);
-    let check = cx.debug_bounds("sibling-check").expect("check");
-    assert!(cache_row.contains(&check.center()), "check on {check:?}");
+    let bar = cx.debug_bounds("sibling-here").expect("bar");
+    assert!(cache_row.contains(&bar.center()), "bar on {bar:?}");
 
     cx.simulate_mouse_down(
         gpui_kit::point(px(700.), px(600.)),

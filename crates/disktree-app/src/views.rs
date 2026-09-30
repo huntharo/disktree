@@ -689,7 +689,7 @@ fn sibling_menu(
                 .py(space::XS)
                 .when(highlighted, |this| this.bg(theme.hover_fill()))
                 // The pointer moves the one highlight the arrows move, so
-                // two filled rows never compete with the check. Only
+                // two filled rows never compete with the bar. Only
                 // entering a row moves it: a pointer resting on one does not
                 // take the highlight back from the arrow keys.
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -702,15 +702,20 @@ fn sibling_menu(
                     this.choose_sibling(&parent, row.index, cx);
                     window.focus(&this.focus, cx);
                 }))
-                // Where you are keeps its check wherever the highlight goes;
-                // bold alone read as losing to the fill under the pointer.
-                .child(div().flex_shrink_0().w(icon::SM).when(current, |this| {
-                    this.debug_selector(|| "sibling-check".into()).child(
-                        gpui_omarchy::icon(gpui_omarchy::IconName::Check)
-                            .size(icon::SM)
-                            .text_color(theme.accent),
-                    )
-                }))
+                // Where you are keeps a bar, like the Selection panel's,
+                // wherever the highlight goes: bold alone read as losing to
+                // the fill under the pointer. Not a check, which here reads
+                // as picked, and in the removal log means removed.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(space::XS)
+                        .h(text::BODY)
+                        .when(current, |this| {
+                            this.debug_selector(|| "sibling-here".into())
+                                .bg(theme.accent)
+                        }),
+                )
                 .child(
                     div()
                         .flex_1()
