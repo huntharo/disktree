@@ -16,6 +16,7 @@ mod macos;
 mod mft;
 pub mod removal;
 pub mod scan;
+pub mod scan_threads;
 pub mod sharing;
 pub mod size;
 pub mod space;
