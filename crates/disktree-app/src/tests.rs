@@ -1045,11 +1045,15 @@ fn finish_scan(view: &Entity<Disktree>, cx: &mut Window) {
     let epoch = read(view, cx, |app| app.scan_epoch);
     for _ in 0..600 {
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let ready = update(view, cx, |app, cx| {
-            app.poll_scan_once(epoch, cx);
-            app.tree().is_some()
-        });
-        if ready {
+        // Widening keeps the old tree visible while the new scan runs.
+        // Its presence does not mean the requested scan has completed.
+        let running = update(view, cx, |app, cx| app.poll_scan_once(epoch, cx));
+        if !running {
+            assert!(
+                read(view, cx, |app| app.scan_error.is_none()),
+                "the scan failed"
+            );
+            assert!(read(view, cx, |app| app.tree().is_some()));
             return;
         }
     }
