@@ -78,11 +78,17 @@ pub struct Plan {
     pub blocked: Vec<Blocked>,
     /// The scanned root the targets were judged against.
     pub root: PathBuf,
+    /// Scan-derived estimate excluding APFS shared blocks.
+    pub reclaimable_bytes: Option<u64>,
 }
 
 impl Plan {
     pub fn bytes(&self) -> u64 {
         self.targets.iter().map(|target| target.bytes).sum()
+    }
+
+    pub fn reclaimable_bytes(&self) -> u64 {
+        self.reclaimable_bytes.unwrap_or_else(|| self.bytes())
     }
 
     pub const fn is_empty(&self) -> bool {

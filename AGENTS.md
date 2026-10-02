@@ -62,7 +62,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 ## Invariants
 
 1. **Sizes come from `st_blocks * 512` unless apparent size was asked for.**
-   That is the number that comes back when a file is deleted. On Windows it
+   APFS clones can share those blocks; private-byte estimates are reported
+   separately without changing tile weights. On Windows it
    is the allocation the directory listing reports; see `windows.rs`. An
    elevated scan of a whole NTFS drive reads it from the master file table
    instead, keeping the walk's rules for hidden entries, links, cloud
@@ -108,6 +109,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | free space and projections | `crates/disktree-core/src/space.rs` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
+| APFS clone hints and private-size system calls | `crates/disktree-core/src/macos.rs` — isolated `unsafe` |
+| clone sharing totals and conservative savings | `crates/disktree-core/src/sharing.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |

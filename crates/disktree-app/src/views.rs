@@ -266,8 +266,8 @@ fn delete_dialog(
         targets => format!("Delete {} items permanently?", targets.len()),
     };
     let body = format!(
-        "This frees {}. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
-        human_bytes(plan.bytes())
+        "Estimated to free ≈ {}. Shared blocks and snapshots may retain space. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
+        human_bytes(plan.reclaimable_bytes())
     );
     let confirm = cx.entity().downgrade();
     let cancel = confirm.clone();
@@ -1228,6 +1228,19 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
             widgets::human_count(files),
             widgets::human_count(dirs)
         ))
+        .when(tree.is_some_and(|node| node.sharing().files > 0), |this| {
+            let sharing = tree.expect("checked above").sharing();
+            this.child(format!(
+                "· APFS clones: {} · ≈ {} counted again{}",
+                human_bytes(sharing.bytes),
+                human_bytes(sharing.duplicate_bytes),
+                if sharing.groups_truncated {
+                    " (partial)"
+                } else {
+                    ""
+                }
+            ))
+        })
         .when(errors > 0, |this| {
             this.child(div().text_color(theme.warning).child(format!(
                 "· {} unreadable",
@@ -1440,7 +1453,21 @@ fn selection_section(
             text::TITLE,
             cx,
         ))
-        .child(widgets::bar(share, highlight, cx));
+        .child(widgets::bar(share, highlight, cx))
+        .when(node.sharing().files > 0, |this| {
+            this.child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(format!(
+                        "APFS clones · frees ≈ {} excluding shared blocks",
+                        human_bytes(node.sharing().reclaimable(node.bytes))
+                    )),
+            )
+            .when(node.sharing().unknown_files > 0, |this| {
+                this.child("Some clone private sizes are unavailable")
+            })
+        });
 
     let fourth = if node.is_dir()
         && let Some(path) = &path
@@ -2039,7 +2066,7 @@ fn disk_section(
                 .child("Free space is not available here"),
         );
     };
-    let reclaiming = app.plan().bytes();
+    let reclaiming = app.plan().reclaimable_bytes();
     let after = space_info.after_removing(reclaiming);
     let highlight = palette::highlight(theme);
     let (number, unit) =
@@ -2072,7 +2099,7 @@ fn disk_section(
                         ))
                         .text_color(highlight)
                         .child(format!(
-                            "→ {} free",
+                            "→ ≈ {} free",
                             human_bytes(after.available)
                         )),
                 )
@@ -2168,7 +2195,7 @@ fn review_button(
                 .overflow_hidden()
                 .text_ellipsis()
                 .child(format!(
-                    "Review {count} marked · frees {}…",
+                    "Review {count} marked · frees ≈ {}…",
                     human_bytes(reclaiming)
                 )),
         )
@@ -2554,9 +2581,9 @@ fn review(
         .child(screen_header(
             "Review",
             &format!(
-                "{} marked \u{00b7} {} to free",
+                "{} marked \u{00b7} ≈ {} to free",
                 app.marks.len(),
-                human_bytes(plan.bytes())
+                human_bytes(plan.reclaimable_bytes())
             ),
             &theme,
             cx,
@@ -2678,7 +2705,7 @@ fn review_summary(
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
-    let reclaiming = plan.bytes();
+    let reclaiming = plan.reclaimable_bytes();
     let trash = app.trash_backend.is_available();
 
     // One silhouette for one either-or choice, reversible option first.
@@ -2765,12 +2792,21 @@ fn review_summary(
                     cx,
                 ))
                 .child(widgets::row(
-                    "Space freed",
+                    if app.removal_mode == RemovalMode::Trash {
+                        "After emptying trash (est.)"
+                    } else {
+                        "Estimated space freed"
+                    },
                     human_bytes(reclaiming),
                     cx,
                 )),
         );
 
+    if cfg!(target_os = "macos") {
+        panel = panel.child(div().text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child("Estimate excludes shared clone blocks. Removing all copies together can free more; snapshots can retain space. Rescan to update estimates."));
+    }
     if let Some(volume) = app.space {
         panel = panel.child(
             div()

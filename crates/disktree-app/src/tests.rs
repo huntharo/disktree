@@ -1659,6 +1659,77 @@ fn restart_arguments_parse_back_to_the_same_scan() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[gpui_kit::test]
+fn apfs_clones_use_private_bytes_in_review_and_refresh(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    // The macOS system-tree guard deliberately refuses canonical /private.
+    let temp = tempfile::tempdir_in(std::env::current_dir().expect("cwd"))
+        .expect("tempdir in the checkout");
+    let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+    std::fs::create_dir(root.join("copies")).expect("mkdir");
+    let original = root.join("original");
+    std::fs::write(&original, vec![0x5a; 8 * 1024 * 1024]).expect("write");
+    assert!(
+        std::process::Command::new("cp")
+            .arg("-c")
+            .arg(&original)
+            .arg(root.join("copies/clone"))
+            .status()
+            .expect("cp -c")
+            .success()
+    );
+    let options = ScanOptions::default();
+    let tree = scan(&root, options.clone()).expect("scan");
+    let root_for_view = root.clone();
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_tree(root_for_view.clone(), tree, options, 3, cx)
+    });
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        let index = app
+            .tree()
+            .expect("tree")
+            .children
+            .iter()
+            .position(|node| node.name.as_ref() == "copies")
+            .expect("copies");
+        app.toggle_mark(&[index], cx);
+        app.screen = Screen::Review;
+    });
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.plan().bytes(), 8 * 1024 * 1024);
+        assert_eq!(app.plan().reclaimable_bytes(), 0);
+    });
+    update(&view, cx, |app, _| {
+        app.removal_mode = RemovalMode::Permanent;
+        app.confirm_open = true;
+    });
+    draw(cx);
+    update(&view, cx, |app, _| app.confirm_open = false);
+    // Break sharing and refresh the same absolute-path mark.
+    std::fs::remove_file(root.join("copies/clone")).expect("remove clone");
+    std::fs::write(root.join("copies/clone"), vec![0x31; 8 * 1024 * 1024])
+        .expect("replace");
+    let refreshed = scan(&root, ScanOptions::default()).expect("rescan");
+    update(&view, cx, |app, _| {
+        app.marks.refresh(
+            &root,
+            &refreshed,
+            disktree_core::tree::Metric::Bytes,
+        );
+        app.tree = Some(std::sync::Arc::new(refreshed.clone()));
+    });
+    assert_eq!(
+        read(&view, cx, |app| app.plan().reclaimable_bytes()),
+        8 * 1024 * 1024
+    );
+    draw(cx);
+}
+
 #[gpui_kit::test]
 fn power_efficiency_menu_saves_without_discarding_the_tree(
     cx: &mut TestAppContext,
