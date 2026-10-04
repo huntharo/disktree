@@ -71,6 +71,76 @@ fn draw(cx: &mut Window) {
     });
 }
 
+#[cfg(target_os = "macos")]
+#[gpui_kit::test]
+fn private_service_stores_draw_unavailable_and_partial_figures(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::macos_services::{Usage, usage};
+    use disktree_core::tree::{Metric, Node, NodeKind, aggregate};
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        // Replace the fixture's tree without starting a real system scan.
+        let mut history = Node::directory(".fseventsd");
+        history.read_error = true;
+        let mut index = Node::directory(".Spotlight-V100");
+        index
+            .children
+            .push(Node::entry("store", NodeKind::File, 8192));
+        index.read_error = true;
+        let mut data = Node::directory("Data");
+        data.children = vec![history, index];
+        let mut volumes = Node::directory("Volumes");
+        volumes.children.push(data);
+        let mut system = Node::directory("System");
+        system.children.push(volumes);
+        let mut root = Node::directory("/");
+        root.children.push(system);
+        aggregate(&mut root, Metric::Bytes);
+        disktree_core::classify::classify(&mut root);
+        app.tree = Some(std::sync::Arc::new(root));
+        app.root_path = PathBuf::from("/");
+        app.selected = None;
+        app.hovered = None;
+        app.options = ScanOptions::default();
+        app.progress.errors = 2;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("macos-services").is_some());
+    read(&view, cx, |app| {
+        let tree = app.tree().expect("fixture tree");
+        let data = Path::new(disktree_core::space::MACOS_DATA_VOLUME);
+        assert_eq!(
+            usage(&app.root_path, tree, &app.options, &data.join(".fseventsd")),
+            Usage::Unavailable
+        );
+        assert_eq!(
+            usage(
+                &app.root_path,
+                tree,
+                &app.options,
+                &data.join(".Spotlight-V100")
+            ),
+            Usage::Incomplete(8192)
+        );
+    });
+    update(&view, cx, |app, cx| {
+        app.selected = app.tree().and_then(|tree| {
+            tree.find(".Spotlight-V100").map(|(crumbs, _)| crumbs)
+        });
+        cx.notify();
+    });
+    draw(cx);
+    press(cx, "space");
+    assert!(read(&view, cx, |app| app.plan().targets.is_empty()));
+    assert!(read(&view, cx, |app| !app.plan().blocked.is_empty()));
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+}
+
 fn press(cx: &mut Window, keys: &str) {
     cx.simulate_keystrokes(keys);
     draw(cx);

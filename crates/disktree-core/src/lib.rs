@@ -12,6 +12,7 @@ pub mod filter;
 pub mod insights;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod macos_services;
 #[cfg(windows)]
 mod mft;
 pub mod removal;
