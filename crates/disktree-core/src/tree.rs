@@ -76,7 +76,7 @@ pub struct Node {
     pub dirs: u64,
     /// `(device, inode)` for files, used to de-duplicate hardlinks.
     pub inode: Option<(u64, u64)>,
-    /// The directory could not be read; its contents are unknown.
+    /// Some entries here or below could not be read; totals are incomplete.
     pub read_error: bool,
     /// Newest write time at or beneath this node, in Unix seconds; `0` when
     /// unknown. Derived for directories by [`aggregate`].
@@ -360,6 +360,7 @@ fn aggregate_at(
         }
     }
     for child in &node.children {
+        node.read_error |= child.read_error;
         modified = modified.max(child.modified);
         // Saturating: a corrupt volume's file table can claim any size.
         bytes = child.bytes.saturating_add(bytes);

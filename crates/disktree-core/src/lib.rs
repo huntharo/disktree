@@ -10,6 +10,7 @@ pub mod classify;
 pub mod export;
 pub mod filter;
 pub mod insights;
+pub mod macos;
 #[cfg(windows)]
 mod mft;
 pub mod removal;
