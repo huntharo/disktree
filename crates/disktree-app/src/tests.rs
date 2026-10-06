@@ -131,19 +131,7 @@ fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
     assert!(read(&view, cx, |app| app.tree().is_none()));
     assert!(cx.debug_bounds("disktree-root").is_some());
 
-    let epoch = read(&view, cx, |app| app.scan_epoch);
-    let mut ready = false;
-    for _ in 0..600 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        ready = update(&view, cx, |app, cx| {
-            app.poll_scan_once(epoch, cx);
-            app.tree().is_some()
-        });
-        if ready {
-            break;
-        }
-    }
-    assert!(ready, "the scan landed");
+    finish_scan(&view, cx);
     draw(cx);
 
     let (tiles, selected, hidden_present) = update(&view, cx, |app, _| {
@@ -381,6 +369,68 @@ fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
 
     let hovered = read(&view, cx, |app| app.hovered.clone());
     assert_eq!(hovered.as_deref(), Some(biggest.as_slice()));
+}
+
+#[gpui_kit::test]
+fn right_click_selects_the_tile_and_reveals_it(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let (at, target, path) = update(&view, cx, |app, _| {
+        let biggest = app
+            .layout()
+            .and_then(|tiles| {
+                tiles
+                    .iter()
+                    .max_by(|left, right| {
+                        left.rect.area().total_cmp(&right.rect.area())
+                    })
+                    .map(|tile| tile.crumbs().to_vec())
+            })
+            .expect("a tile");
+        let rect = app.tile_rect(&biggest).expect("a rectangle");
+        let screen = app.view.project(rect);
+        let (x, y) = (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0);
+        // The deepest tile there, which is what a click resolves to.
+        let target = app.tile_at(x, y).expect("a tile under the pointer");
+        let path = app.path_at(&target).expect("a path");
+        let origin = app.treemap_origin.get();
+        (Point::new(origin.x + px(x), origin.y + px(y)), target, path)
+    });
+
+    // The test platform cannot open a file manager, so take the path away
+    // first: the reveal then reports it instead of reaching the platform.
+    if path.is_dir() {
+        std::fs::remove_dir_all(&path).expect("remove");
+    } else {
+        std::fs::remove_file(&path).expect("remove");
+    }
+
+    cx.simulate_mouse_down(
+        at,
+        gpui_kit::MouseButton::Right,
+        gpui_kit::Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        at,
+        gpui_kit::MouseButton::Right,
+        gpui_kit::Modifiers::none(),
+    );
+    draw(cx);
+
+    let (selected, notice) = read(&view, cx, |app| {
+        (
+            app.selected.clone(),
+            app.notice.as_ref().map(|(text, _)| text.clone()),
+        )
+    });
+    assert_eq!(selected, Some(target), "the clicked tile is selected");
+    assert!(
+        notice.is_some_and(|text| text.contains("no longer on disk")),
+        "the reveal ran for it"
+    );
 }
 
 #[gpui_kit::test]
@@ -1040,20 +1090,28 @@ fn after_descending_every_tile_is_inside_the_directory_drawn(
     assert_eq!(hatched, 1, "exactly the marked tile is hatched");
 }
 
-/// Drive the scan the view started until its tree lands.
+/// Drive the scan the view started until its outcome has been applied.
+///
+/// The scan is what is waited on, not the tree: widening keeps the old tree
+/// on screen while the wider root is read, so a tree being there does not
+/// mean the requested scan has completed.
 fn finish_scan(view: &Entity<Disktree>, cx: &mut Window) {
+    // Without a scan in flight the poller reports "stopped" at once, and the
+    // wait would pass without having waited for anything.
+    assert!(
+        read(view, cx, |app| app.scan.is_some()),
+        "no scan to finish"
+    );
     let epoch = read(view, cx, |app| app.scan_epoch);
     for _ in 0..600 {
         std::thread::sleep(std::time::Duration::from_millis(5));
-        // Widening keeps the old tree visible while the new scan runs.
-        // Its presence does not mean the requested scan has completed.
         let running = update(view, cx, |app, cx| app.poll_scan_once(epoch, cx));
         if !running {
-            assert!(
-                read(view, cx, |app| app.scan_error.is_none()),
-                "the scan failed"
-            );
-            assert!(read(view, cx, |app| app.tree().is_some()));
+            let (error, tree) = read(view, cx, |app| {
+                (app.scan_error.clone(), app.tree().is_some())
+            });
+            assert_eq!(error, None, "the scan failed");
+            assert!(tree, "the scan landed without a tree");
             return;
         }
     }
@@ -1618,6 +1676,12 @@ fn restart_arguments_parse_back_to_the_same_scan() {
         include_hidden: false,
         one_filesystem: false,
         metric: Metric::Files,
+        threads: disktree_core::scan_threads::ScanThreads {
+            max_threads: 8,
+            adaptive: true,
+            retained_throughput: 0.85,
+            system_cpu_limit: Some(0.70),
+        },
         ..ScanOptions::default()
     };
     for (options, depth) in [(changed, 5), (ScanOptions::default(), 1)] {
@@ -1626,6 +1690,18 @@ fn restart_arguments_parse_back_to_the_same_scan() {
         assert_eq!(parsed.root, root);
         assert_eq!(parsed.depth, depth);
         let got = &parsed.options;
+        assert_eq!(got.threads.max_threads, options.threads.max_threads);
+        assert_eq!(got.threads.adaptive, options.threads.adaptive);
+        assert!(
+            (got.threads.retained_throughput
+                - options.threads.retained_throughput)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            got.threads.system_cpu_limit,
+            options.threads.system_cpu_limit
+        );
         assert_eq!(
             (
                 got.apparent_size,
@@ -1643,4 +1719,128 @@ fn restart_arguments_parse_back_to_the_same_scan() {
             )
         );
     }
+}
+
+#[gpui_kit::test]
+fn power_efficiency_menu_saves_without_discarding_the_tree(
+    cx: &mut TestAppContext,
+) {
+    use crate::power::{self, PowerEfficiency as Power};
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let config = tempfile::tempdir().expect("config");
+    let path = config.path().join("power-efficiency");
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    update(&view, cx, |app, _| {
+        app.power_settings_path = Some(path.clone());
+        // Enough CPUs that every preset is offered, whatever runs the test.
+        app.cpu_threads = 18;
+    });
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+    for preset in Power::ALL {
+        draw(cx);
+        let button = cx.debug_bounds("power-efficiency").expect("control");
+        cx.simulate_click(button.center(), Modifiers::none());
+        draw(cx);
+        let choice = cx.debug_bounds(preset.key()).expect("preset");
+        cx.simulate_click(choice.center(), Modifiers::none());
+        draw(cx);
+        assert_eq!(power::load(&path).expect("saved"), preset);
+        read(&view, cx, |app| {
+            assert_eq!(app.power_choice, Some(preset));
+            assert_eq!(
+                app.options.threads.max_threads,
+                preset.threads(app.cpu_threads)
+            );
+            assert!(!app.options.threads.adaptive);
+            assert!(app.power_menu.is_none());
+            assert_eq!(app.scan_epoch, epoch);
+            assert!(app.tree.is_some());
+        });
+    }
+    // Persistence failure must not masquerade as a saved preference.
+    update(&view, cx, |app, cx| {
+        app.power_settings_path = Some(config.path().to_owned());
+        app.set_power_efficiency(Power::Miser, cx);
+    });
+    assert!(read(&view, cx, |app| app.notice.as_ref().is_some_and(
+        |(message, _)| message.contains("could not be saved")
+    )));
+    update(&view, cx, Disktree::start_scan);
+    assert_eq!(read(&view, cx, |app| app.scan_epoch), epoch + 1);
+}
+
+#[gpui_kit::test]
+fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
+    cx: &mut TestAppContext,
+) {
+    use crate::power::PowerEfficiency as Power;
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let config = tempfile::tempdir().expect("config");
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    update(&view, cx, |app, _| {
+        app.power_settings_path = Some(config.path().join("power"));
+        // Aggressive and Drain My Battery would both run four workers.
+        app.cpu_threads = 4;
+        app.power_choice = Some(Power::Balanced);
+    });
+    draw(cx);
+    let toggle = cx.debug_bounds("power-efficiency").expect("control");
+    cx.simulate_mouse_move(toggle.center(), None, Modifiers::none());
+    cx.simulate_click(toggle.center(), Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.power_menu), Some(1));
+
+    // The pointer takes the highlight, and the check stays on what is saved.
+    let miser = cx.debug_bounds(Power::Miser.key()).expect("row");
+    cx.simulate_mouse_move(miser.center(), None, Modifiers::none());
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.power_menu), Some(0));
+    let balanced = cx.debug_bounds(Power::Balanced.key()).expect("row");
+    let check = cx.debug_bounds("power-check").expect("check");
+    assert!(balanced.contains(&check.center()), "check on {check:?}");
+
+    // A disabled row ignores the click and leaves the menu to be dismissed.
+    let drain = cx.debug_bounds(Power::DrainMyBattery.key()).expect("row");
+    cx.simulate_click(drain.center(), Modifiers::none());
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.power_choice, Some(Power::Balanced));
+        assert!(app.notice.is_none());
+    });
+
+    // The arrows step over what is not offered, and Enter chooses.
+    update(&view, cx, |app, cx| {
+        app.power_menu = None;
+        app.toggle_power_menu(cx);
+    });
+    press(cx, "down");
+    assert_eq!(read(&view, cx, |app| app.power_menu), Some(1));
+    press(cx, "up");
+    assert_eq!(read(&view, cx, |app| app.power_menu), Some(0));
+    press(cx, "enter");
+    read(&view, cx, |app| {
+        assert_eq!(app.power_choice, Some(Power::Miser));
+        assert_eq!(app.options.threads.max_threads, 2);
+        assert!(app.power_menu.is_none());
+    });
+
+    // The button closes what it opened, rather than the press outside the
+    // menu closing it only for the click to open it again.
+    draw(cx);
+    let toggle = cx.debug_bounds("power-efficiency").expect("control");
+    cx.simulate_mouse_move(toggle.center(), None, Modifiers::none());
+    cx.simulate_click(toggle.center(), Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.power_menu.is_some()));
+    cx.simulate_click(toggle.center(), Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }

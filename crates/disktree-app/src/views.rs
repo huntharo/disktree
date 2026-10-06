@@ -6,7 +6,7 @@
 
 use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
-use disktree_core::removal::{RemovalMode, Target};
+use disktree_core::removal::{Plan, RemovalMode, Target};
 use disktree_core::size::human_bytes;
 use disktree_core::tree::Metric;
 use gpui_kit::base::CheckboxState;
@@ -476,10 +476,13 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
     } else {
         0..0
     };
+    // Short of room, the trail gives up its start, never the crumb you are
+    // in and its menu: content packed to the end overflows to the left.
     let mut row = div()
         .flex()
         .flex_row()
         .items_center()
+        .justify_end()
         .gap(space::XXS)
         .min_w_0()
         .overflow_hidden();
@@ -978,6 +981,206 @@ fn view_settings(
         .child(hidden)
         .child(apparent)
         .child(depth_control)
+        .child(power_efficiency(app, cx))
+}
+
+/// What the tooltip says the choice will do, where the gauge alone cannot.
+/// Measured on an 18-core Apple silicon Mac scanning its whole Data volume
+/// (medians of three): 4 workers 209 s and 433 CPU-seconds, 8 workers 133 s
+/// and 580, 18 workers 137 s and 1,314. Elsewhere the shape is expected, not
+/// measured, so it gives no numbers.
+const POWER_TRADEOFF: &str = if cfg!(target_os = "macos") {
+    "Up to about 8 workers a scan finishes sooner: a whole drive took a \
+     third less time with 8 than with Balanced. Past that it is no faster, \
+     but uses over twice the CPU and runs the fans at full speed."
+} else {
+    "More workers finish a scan sooner only up to a point. Past it they \
+     use more CPU for no gain, and can run the fans at full speed."
+};
+
+/// How hard a scan may work, as a signal gauge framed like Depth; the
+/// presets are in a menu built like the sibling menu, so the control costs
+/// the bar no more than one button. Like the other settings, focus returns
+/// to the treemap.
+fn power_efficiency(app: &Disktree, cx: &Context<'_, Disktree>) -> Div {
+    use crate::power::{self, PowerEfficiency};
+
+    let theme = cx.omarchy().clone();
+    let cpus = app.cpu_threads;
+    let threads = app.options.threads.max_threads.min(cpus);
+    let name = app.power_choice.map_or("Custom", PowerEfficiency::name);
+    let open = app.power_menu.is_some();
+    let trigger = div()
+        .id("power-efficiency")
+        .debug_selector(|| "power-efficiency".into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .border_1()
+        .border_color(theme.control_border())
+        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            this.power_hover = *hovered;
+            cx.notify();
+        }))
+        .child(
+            button("power-toggle", "", ButtonVariant::Secondary, cx)
+                .accessibility_label(format!("Power Efficiency: {name}"))
+                .selected(open)
+                .tab_stop(false)
+                .child(widgets::signal(
+                    PowerEfficiency::signal(threads, cpus),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child("\u{25be}"),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_power_menu(cx);
+                    window.focus(&this.focus, cx);
+                })),
+        );
+    // An open menu says it all; the tooltip would only cover it.
+    let trigger = if open {
+        trigger
+    } else {
+        with_tooltip(
+            trigger,
+            format!(
+                "Power Efficiency: {name} \u{00b7} {} of {cpus} CPUs\n\
+                 {POWER_TRADEOFF}\nUsed from the next scan, and remembered.",
+                power::workers(threads)
+            ),
+        )
+    };
+    let mut control = div().relative().child(trigger);
+    let Some(highlighted) = app.power_menu else {
+        return control;
+    };
+
+    let mut menu = div()
+        .id("power-menu")
+        .debug_selector(|| "power-menu".into())
+        .occlude()
+        .flex()
+        .flex_col()
+        .w(size::POWER_MENU)
+        .p(space::XS)
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.control_border())
+        .shadow_lg()
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            if !this.power_hover {
+                this.power_menu = None;
+                cx.notify();
+            }
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .px(space::SM)
+                .py(space::XS)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.8))
+                .child("Scan workers")
+                .child(format!("{cpus} CPUs")),
+        );
+    for (index, preset) in PowerEfficiency::ALL.into_iter().enumerate() {
+        let offered = preset.available(cpus);
+        let current = app.power_choice == Some(preset);
+        let count = preset.threads(cpus);
+        let row = div()
+            .id(preset.key())
+            .debug_selector(move || preset.key().into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::MD)
+            .px(space::SM)
+            .py(space::XS)
+            .when(index == highlighted && offered, |this| {
+                this.bg(theme.hover_fill())
+            })
+            // The saved preset keeps its check wherever the highlight goes;
+            // bold alone read as losing to the fill under the pointer.
+            .child(div().flex_shrink_0().w(icon::SM).when(current, |this| {
+                this.debug_selector(|| "power-check".into()).child(
+                    gpui_omarchy::icon(gpui_omarchy::IconName::Check)
+                        .size(icon::SM)
+                        .text_color(theme.accent),
+                )
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(text::BODY)
+                    .text_color(theme.bright)
+                    .when(current, |this| this.font_weight(FontWeight::BOLD))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(preset.name()),
+            )
+            .child(div().flex_shrink_0().w(size::ROW_BAR).child(widgets::bar(
+                count as f32 / cpus as f32,
+                theme.accent,
+                cx,
+            )))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .w(size::SIZE_LANE)
+                    .flex()
+                    .justify_end()
+                    .text_size(text::BODY)
+                    .text_color(theme.secondary)
+                    .child(power::workers(count)),
+            );
+        // A preset this machine cannot tell apart from the one below it is
+        // shown, so the scale stays the same everywhere, but not offered.
+        let row = if offered {
+            // The pointer moves the one highlight the arrows move, so two
+            // filled rows never compete with the check.
+            row.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered && this.power_menu.is_some() {
+                    this.power_menu = Some(index);
+                    cx.notify();
+                }
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_power_efficiency(preset, cx);
+                window.focus(&this.focus, cx);
+            }))
+        } else {
+            let below = PowerEfficiency::ALL[index - 1].name();
+            with_tooltip(
+                row.opacity(0.45),
+                format!("Same as {below} with {cpus} CPUs"),
+            )
+        };
+        menu = menu.child(row);
+    }
+    control = control.child(
+        div().absolute().top_full().right_0().child(
+            deferred(
+                // Hung from the gauge's right edge: the bar's last control,
+                // so the menu opens inward rather than off the window.
+                anchored()
+                    .anchor(gpui_kit::Anchor::TopRight)
+                    .snap_to_window_with_margin(px(8.))
+                    .offset(gpui_kit::point(px(0.), px(4.)))
+                    .child(menu),
+            )
+            .with_priority(2),
+        ),
+    );
+    control
 }
 
 // ── trail and legend ────────────────────────────────────────────────────
@@ -1009,7 +1212,7 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
     let tree = app.tree();
     let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
     let files = tree.map_or(app.progress.files, |node| node.files);
-    let dirs = tree.map_or(app.progress.dirs, |node| node.dirs);
+    let dirs = tree.map_or(app.progress.dirs, |node| u64::from(node.dirs));
     let errors = app.progress.errors;
     div()
         .flex()
@@ -1836,7 +2039,10 @@ fn disk_section(
                 .child("Free space is not available here"),
         );
     };
-    let reclaiming = app.plan().bytes();
+    let plan = app.plan();
+    // The meter measures this volume, so it projects only the marks whose
+    // bytes come back to it; the rest is said, never added.
+    let reclaiming = plan.reclaim();
     let after = space_info.after_removing(reclaiming);
     let highlight = palette::highlight(theme);
     let (number, unit) =
@@ -1907,6 +2113,14 @@ fn disk_section(
                     ),
             ),
     );
+    if let Some(left_out) = not_counted(&plan) {
+        section = section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!("not counted here: {left_out}")),
+        );
+    }
     section
         .child(
             div()
@@ -1922,6 +2136,24 @@ fn disk_section(
             (!app.marks.is_empty())
                 .then(|| review_button(app, reclaiming, theme, cx)),
         )
+}
+
+/// What the volume meter leaves out, and why, when it leaves anything out:
+/// bytes marked on another volume come back there, and bytes no volume can
+/// be found for are not claimed at all. `None` when every marked byte is
+/// this volume's, which is the usual case.
+fn not_counted(plan: &Plan) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if plan.foreign() > 0 {
+        parts.push(format!("{} on other volumes", human_bytes(plan.foreign())));
+    }
+    if plan.unattributed() > 0 {
+        parts.push(format!(
+            "{} could not be placed",
+            human_bytes(plan.unattributed())
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// The way to the review screen, where the saving is: it says what is
@@ -2475,7 +2707,13 @@ fn review_summary(
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
-    let reclaiming = plan.bytes();
+    // What comes back to the volume on screen, which is all its meter can
+    // project; the totals below say what the removal does in full.
+    let reclaiming = plan.reclaim();
+    // The part of the saving that lands elsewhere, said rather than added to
+    // this volume's projection, so the two numbers cannot be confused.
+    let left_out = not_counted(plan)
+        .map(|left_out| widgets::row("Not counted here", left_out, cx));
     let trash = app.trash_backend.is_available();
 
     // One silhouette for one either-or choice, reversible option first.
@@ -2563,9 +2801,10 @@ fn review_summary(
                 ))
                 .child(widgets::row(
                     "Space freed",
-                    human_bytes(reclaiming),
+                    human_bytes(plan.bytes()),
                     cx,
-                )),
+                ))
+                .children(left_out),
         );
 
     if let Some(volume) = app.space {
@@ -3205,9 +3444,10 @@ fn node_card(
                     "{} files · {} dirs · {} direct",
                     widgets::human_count(node.files),
                     widgets::human_count(
-                        node.dirs.saturating_sub(u64::from(node.is_dir()))
+                        u64::from(node.dirs)
+                            .saturating_sub(u64::from(node.is_dir()))
                     ),
-                    human_bytes(node.own_bytes)
+                    human_bytes(node.own_bytes())
                 )),
         );
 

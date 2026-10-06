@@ -19,6 +19,7 @@
 use std::fs::DirEntry;
 use std::fs::{self, Metadata};
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -28,6 +29,7 @@ use std::thread;
 use rayon::Scope;
 use rustc_hash::FxHashSet;
 
+use crate::scan_threads::{Admission, ControllerGuard, ScanThreads};
 use crate::tree::{Metric, Node, NodeKind, Seen, aggregate, aggregate_deduped};
 
 /// Errors kept verbatim before the list is truncated; the count keeps rising.
@@ -59,6 +61,8 @@ pub struct ScanOptions {
     pub dedup_hardlinks: bool,
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
+    /// Directory admission for this scan; other scans have their own budget.
+    pub threads: ScanThreads,
 }
 
 impl Default for ScanOptions {
@@ -71,6 +75,7 @@ impl Default for ScanOptions {
             max_depth: None,
             dedup_hardlinks: true,
             metric: Metric::Bytes,
+            threads: ScanThreads::default(),
         }
     }
 }
@@ -89,6 +94,11 @@ pub struct ScanProgress {
     finished: AtomicBool,
     cancelled: AtomicBool,
     messages: Mutex<Vec<String>>,
+    pub(crate) threads: AtomicUsize,
+    pub(crate) threads_settled: AtomicBool,
+    pub(crate) thread_tuning_complete: AtomicBool,
+    pub(crate) system_cpu_limited: AtomicBool,
+    pub(crate) worker_transitions: AtomicU64,
 }
 
 /// A point-in-time view of [`ScanProgress`].
@@ -100,11 +110,21 @@ pub struct ScanSnapshot {
     pub errors: u64,
     pub finished: bool,
     pub cancelled: bool,
+    /// Admitted directory jobs, not a machine-wide thread limit.
+    pub threads: usize,
+    pub threads_settled: bool,
+    pub thread_tuning_complete: bool,
+    pub system_cpu_limited: bool,
+    pub worker_transitions: u64,
     /// Up to [`MAX_ERROR_DETAIL`] unreadable paths, most recent last.
     pub messages: Vec<String>,
 }
 
 impl ScanProgress {
+    pub(crate) fn entries(&self) -> u64 {
+        self.files.load(Ordering::Relaxed) + self.dirs.load(Ordering::Relaxed)
+    }
+
     /// What a directory's listing found (see `Tally`), or what a reader
     /// that measures in bulk has come across so far.
     pub(crate) fn add(&self, files: u64, dirs: u64, bytes: u64) {
@@ -155,6 +175,13 @@ impl ScanProgress {
             errors: self.errors.load(Ordering::Relaxed),
             finished: self.finished.load(Ordering::Relaxed),
             cancelled: self.is_cancelled(),
+            threads: self.threads.load(Ordering::Relaxed),
+            threads_settled: self.threads_settled.load(Ordering::Relaxed),
+            thread_tuning_complete: self
+                .thread_tuning_complete
+                .load(Ordering::Relaxed),
+            system_cpu_limited: self.system_cpu_limited.load(Ordering::Relaxed),
+            worker_transitions: self.worker_transitions.load(Ordering::Relaxed),
             messages: lock(&self.messages).clone(),
         }
     }
@@ -488,7 +515,8 @@ trait Listed {
     fn directory(&self) -> io::Result<Directory>;
     /// Hidden by an attribute rather than by a leading dot: on Windows,
     /// where the listing carries it, so `AppData` is hidden as Explorer
-    /// hides it. macOS's `UF_HIDDEN` would cost a stat per entry.
+    /// hides it. Finder's `UF_HIDDEN` is not asked for: on macOS, hidden
+    /// means a leading dot, as on Linux.
     fn hidden(&self) -> bool {
         false
     }
@@ -790,18 +818,16 @@ impl PendingDir {
     /// Turn a completed directory into a node. Only called when `pending` has
     /// reached zero, so every child is already in `self.partial`.
     ///
-    /// `bytes` and `own_bytes` are left at zero on purpose: the walk cannot
-    /// know the aggregate, and [`crate::tree::aggregate`] derives both from the
-    /// children once every child is present.
+    /// `bytes` is left at zero on purpose: the walk cannot know the
+    /// aggregate, and [`crate::tree::aggregate`] derives it from the children
+    /// once every child is present.
     fn build(&self) -> Node {
         let partial = std::mem::take(&mut *lock(&self.partial));
         Node {
             name: partial.name,
             kind: NodeKind::Directory,
             bytes: 0,
-            own_bytes: 0,
             files: 0,
-            own_files: 0,
             dirs: 1,
             inode: None,
             read_error: self.read_error.load(Ordering::Relaxed),
@@ -814,6 +840,32 @@ impl PendingDir {
 }
 
 fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
+    let owned = fixed_pool(context.options.threads)?;
+    let pool = owned.as_ref().unwrap_or_else(|| &WALK_POOL);
+    scan_on_pool(root, context, pool)
+}
+
+/// Explicit fixed budgets cover enumeration, the Windows file-table path and
+/// tree finishing. A scan owns its pool so a new setting needs no global reset.
+/// Default core callers and experimental adaptive scans retain the shared pool.
+fn fixed_pool(threads: ScanThreads) -> io::Result<Option<rayon::ThreadPool>> {
+    if threads.adaptive || threads.max_threads == usize::MAX {
+        return Ok(None);
+    }
+    let cpus = thread::available_parallelism().map_or(1, usize::from);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max_threads.clamp(1, cpus))
+        .thread_name(|index| format!("disktree-scan-{index}"))
+        .build()
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+fn scan_on_pool(
+    root: &Path,
+    context: &Arc<WalkContext>,
+    pool: &rayon::ThreadPool,
+) -> io::Result<Node> {
     let root_meta = fs::metadata(root)?;
     if !root_meta.is_dir() {
         return Err(io::Error::new(
@@ -845,7 +897,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     #[cfg(windows)]
     {
         let progress = &context.progress;
-        let read = WALK_POOL.install(|| {
+        let read = pool.install(|| {
             crate::mft::scan(root, canonical, &context.options, progress)
         });
         if let Some(node) = read {
@@ -855,10 +907,10 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             if progress.is_cancelled() {
                 return Err(crate::mft::cancelled());
             }
-            let node = finish_tree(node, &context.options);
+            let node = finish_tree(node, &context.options, pool);
             // The reader counted every file on the volume; the tree may
             // hold fewer.
-            progress.settle(node.files, node.dirs, node.bytes);
+            progress.settle(node.files, u64::from(node.dirs), node.bytes);
             return Ok(node);
         }
         // The reader gave up, or never started: the walk counts from nothing.
@@ -887,13 +939,52 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
         0,
     ));
     let context: &WalkContext = context;
-    WALK_POOL.install(|| rayon::scope(|scope| walk(scope, &root_dir, context)));
+    pool.install(|| {
+        let mut threads = context.options.threads.normalized();
+        threads.max_threads =
+            threads.max_threads.min(rayon::current_num_threads());
+        context
+            .progress
+            .threads
+            .store(threads.max_threads, Ordering::Relaxed);
+        context
+            .progress
+            .threads_settled
+            .store(true, Ordering::Relaxed);
+        context
+            .progress
+            .thread_tuning_complete
+            .store(!threads.adaptive, Ordering::Relaxed);
+        if !threads.adaptive
+            && threads.max_threads == rayon::current_num_threads()
+        {
+            // Pool-sized fixed scans need no admission lock or ready queue. Keep
+            // existing core callers on Rayon's direct scheduling path.
+            rayon::scope(|scope| {
+                dispatch_fixed(scope, &root_dir, context);
+            });
+        } else {
+            let admission =
+                Arc::new(Admission::new(root_dir, threads.max_threads));
+            // The controller owns no Rayon worker and is joined before finishing
+            // the tree, where entry throughput no longer describes useful work.
+            let _controller = ControllerGuard::spawn(
+                threads,
+                Arc::clone(&admission),
+                Arc::clone(&context.progress),
+            )?;
+            rayon::scope(|scope| {
+                dispatch(scope, admission.start(), context, &admission);
+            });
+        }
+        Ok::<(), io::Error>(())
+    })?;
 
     let node = lock(&context.root).take();
     let node = node.ok_or_else(|| {
         io::Error::other(format!("{} produced no tree", root.display()))
     })?;
-    Ok(finish_tree(node, &context.options))
+    Ok(finish_tree(node, &context.options, pool))
 }
 
 /// The walk's workers, and the file table reader's. Listing directories
@@ -936,7 +1027,7 @@ impl Tally {
         if node.is_dir() {
             // A subtree taken whole from an earlier scan.
             self.files += node.files;
-            self.dirs += node.dirs;
+            self.dirs += node.dirs as u64;
         } else {
             // A link counts as a file on the meter, as it always has,
             // though the tree does not count it.
@@ -954,11 +1045,50 @@ impl Tally {
 /// Read one directory, spawn a task per subdirectory, then report completion.
 ///
 /// Flat tasks inside the scope: the worker stack never grows with tree depth.
-fn walk<'scope>(
+fn dispatch_fixed<'scope>(
     scope: &Scope<'scope>,
     dir: &Arc<PendingDir>,
     context: &'scope WalkContext,
 ) {
+    for child in walk(dir, context) {
+        scope.spawn(move |scope| {
+            dispatch_fixed(scope, &child, context);
+        });
+    }
+}
+
+/// Read one directory, spawn a task per subdirectory, then report completion.
+///
+/// Flat tasks inside the scope: the worker stack never grows with tree depth.
+fn dispatch<'scope>(
+    scope: &Scope<'scope>,
+    jobs: Vec<Arc<PendingDir>>,
+    context: &'scope WalkContext,
+    admission: &Arc<Admission<Arc<PendingDir>>>,
+) {
+    for dir in jobs {
+        let admission = Arc::clone(admission);
+        scope.spawn(move |scope| {
+            let mut next = Some(dir);
+            while let Some(dir) = next.take() {
+                let children = walk(&dir, context);
+                let mut jobs = admission.complete(children);
+                // Continue locally into one ready descendant; only surplus
+                // jobs are offered to other workers. A running directory is
+                // never split, and a retirement returns from this loop.
+                next = jobs.pop();
+                dispatch(scope, jobs, context, &admission);
+            }
+        });
+    }
+}
+
+fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
+    if context.cancelled() {
+        // Queued jobs still own a pending token even when no I/O is needed.
+        signal_done(dir, context);
+        return Vec::new();
+    }
     let mut subdirs: Vec<Arc<PendingDir>> = Vec::new();
     let mut leaves: Vec<Node> = Vec::new();
     let mut tally = Tally::default();
@@ -1023,17 +1153,19 @@ fn walk<'scope>(
         partial.children.reserve_exact(leaves.len() + spawned);
         partial.children.extend(leaves);
     }
+    let mut children = Vec::new();
     if descend {
         for subdir in subdirs {
             if context.cancelled() {
                 break;
             }
             dir.pending.fetch_add(1, Ordering::AcqRel);
-            scope.spawn(move |scope| walk(scope, &subdir, context));
+            children.push(subdir);
         }
     }
 
     signal_done(dir, context);
+    children
 }
 
 /// Report that one task for `dir` is done: either its own scan, or one of its
@@ -1058,8 +1190,12 @@ fn signal_done(dir: &Arc<PendingDir>, context: &WalkContext) {
 /// Charge a hardlinked file once, derive every aggregate from the result,
 /// then classify. On the walk's pool: the UI's own work on the global pool
 /// must not queue behind a scan finishing.
-fn finish_tree(mut node: Node, options: &ScanOptions) -> Node {
-    WALK_POOL.install(|| {
+fn finish_tree(
+    mut node: Node,
+    options: &ScanOptions,
+    pool: &rayon::ThreadPool,
+) -> Node {
+    pool.install(|| {
         if options.dedup_hardlinks {
             aggregate_deduped(&mut node, options.metric, &Seen::new());
         } else {
@@ -1081,7 +1217,9 @@ fn leaf_node(
 ) -> Node {
     let mut node = Node::entry(name, kind, facts.size);
     if track {
-        node.inode = facts.identity;
+        node.inode = facts
+            .identity
+            .and_then(|(device, file)| Some((device, NonZeroU64::new(file)?)));
     }
     node.modified = facts.modified;
     node
@@ -1267,6 +1405,91 @@ mod tests {
     }
 
     #[test]
+    fn fixed_worker_pools_change_size_without_reinitializing_rayon() {
+        let cpus = thread::available_parallelism().map_or(1, usize::from);
+        // Two live pools have independent limits; constructing the first must
+        // not freeze the choice for a later scan or the global UI pool.
+        let make = |count| {
+            fixed_pool(ScanThreads {
+                max_threads: count,
+                ..ScanThreads::default()
+            })
+            .expect("pool")
+            .expect("explicit fixed pool")
+        };
+        let small = make(1);
+        let large = make(4);
+        assert_eq!(small.install(rayon::current_num_threads), 1);
+        assert_eq!(large.install(rayon::current_num_threads), 4.min(cpus));
+        assert!(
+            fixed_pool(ScanThreads::default())
+                .expect("default")
+                .is_none()
+        );
+        assert!(
+            fixed_pool(ScanThreads {
+                adaptive: true,
+                max_threads: 4,
+                ..ScanThreads::default()
+            })
+            .expect("adaptive")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn fixed_worker_pools_preserve_a_wide_deep_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        for index in 0..96 {
+            write(temp.path(), &format!("d{index}/nested/file"), index + 1);
+        }
+        for threads in [1, 2, 4, 8, usize::MAX] {
+            let mut settings = options();
+            settings.threads.max_threads = threads;
+            let tree = scan_dir(temp.path(), &settings);
+            assert_eq!(tree.files, 96);
+            assert_eq!(tree.dirs, 193);
+            assert_eq!(tree.bytes, (1..=96).sum::<u64>());
+        }
+    }
+
+    #[test]
+    fn cancelled_queued_jobs_release_parent_completion_tokens() {
+        let temp = TempDir::new().expect("tempdir");
+        for index in 0..128 {
+            write(temp.path(), &format!("d{index}/file"), 1);
+        }
+        let progress = Arc::new(ScanProgress::default());
+        let context = Arc::new(WalkContext {
+            known: None,
+            options: options(),
+            progress: Arc::clone(&progress),
+            root_device: Mutex::new(None),
+            foreign_mounts: OnceLock::new(),
+            never_scanned: OnceLock::new(),
+            visited_dirs: Mutex::new(FxHashSet::default()),
+            root: Mutex::new(None),
+            volume: OnceLock::new(),
+        });
+        let root = Arc::new(PendingDir::new(
+            temp.path().to_path_buf(),
+            file_name(temp.path()),
+            None,
+            0,
+        ));
+        let queued = walk(&root, &context);
+        assert_eq!(queued.len(), 128);
+        assert!(lock(&context.root).is_none());
+        progress.cancel();
+        for dir in queued {
+            assert!(walk(&dir, &context).is_empty());
+        }
+        let tree = lock(&context.root).take().expect("root completed");
+        assert_eq!(tree.children.len(), 128);
+        assert!(tree.children.iter().all(|child| child.children.is_empty()));
+    }
+
+    #[test]
     fn totals_are_summed_bottom_up() {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path();
@@ -1304,8 +1527,8 @@ mod tests {
         write(root, "sub/deep.bin", 300);
 
         let tree = scan_dir(root, &options());
-        assert_eq!(tree.own_bytes, 700);
-        assert_eq!(tree.own_files, 1);
+        assert_eq!(tree.own_bytes(), 700);
+        assert_eq!(tree.own_files(), 1);
         assert_eq!(tree.bytes, 1000);
         assert_eq!(tree.files, 2);
     }
@@ -1464,7 +1687,7 @@ mod tests {
                 ..options()
             },
         );
-        assert_eq!(tree.own_bytes, 10);
+        assert_eq!(tree.own_bytes(), 10);
         let a = child(&tree, "a");
         assert_eq!(
             a.bytes, 20,
