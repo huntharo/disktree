@@ -224,6 +224,8 @@ impl ScanHandle {
             root_device: Mutex::new(None),
             foreign_mounts: OnceLock::new(),
             never_scanned: OnceLock::new(),
+            data_services: OnceLock::new(),
+            data_device: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
@@ -274,6 +276,8 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
         root_device: Mutex::new(None),
         foreign_mounts: OnceLock::new(),
         never_scanned: OnceLock::new(),
+        data_services: OnceLock::new(),
+        data_device: OnceLock::new(),
         visited_dirs: Mutex::new(FxHashSet::default()),
         root: Mutex::new(None),
         volume: OnceLock::new(),
@@ -297,6 +301,9 @@ struct WalkContext {
     /// Directories no scan enters, on any volume setting: see
     /// [`crate::space::never_scanned`].
     never_scanned: OnceLock<FxHashSet<PathBuf>>,
+    /// A second Data mount exposes private stores, never firmlink aliases.
+    data_services: OnceLock<PathBuf>,
+    data_device: OnceLock<Option<u64>>,
     /// Directories already entered, so followed symlinks cannot loop.
     visited_dirs: Mutex<FxHashSet<(u64, u64)>>,
     /// Set by the root's `complete`, read after the scope joins.
@@ -332,7 +339,7 @@ impl WalkContext {
             Ok(listing) => listing,
             Err(error) => {
                 self.progress.record_error(&entry.entry_path(dir), &error);
-                return Classified::Skipped;
+                return Classified::Unreadable;
             }
         };
 
@@ -357,7 +364,7 @@ impl WalkContext {
             Ok(facts) => self.leaf(entry.take_name(), kind, &facts),
             Err(error) => {
                 self.progress.record_error(&entry.entry_path(dir), &error);
-                Classified::Skipped
+                Classified::Unreadable
             }
         }
     }
@@ -373,6 +380,14 @@ impl WalkContext {
             .is_some_and(|never| never.contains(&path))
         {
             return Classified::Skipped;
+        }
+        if self.data_services.get() == Some(&path) {
+            // `/` presents the system volume beside Data. This one mount
+            // exception is constrained by the whitelist in `walk`.
+            return Classified::Subdirectory {
+                path,
+                name: entry.take_name(),
+            };
         }
         // Read at most once per directory: macOS needs it for the dataless
         // flag, and the device check below wherever the mount table cannot
@@ -405,7 +420,18 @@ impl WalkContext {
                 return Classified::Skipped;
             }
         } else if self.options.one_filesystem {
-            match (directory(), self.root_device(&path)) {
+            let device = if let Some(data) = self
+                .data_services
+                .get()
+                .filter(|data| path.starts_with(data))
+            {
+                *self.data_device.get_or_init(|| {
+                    fs::metadata(data).map(|meta| device_of(&meta)).ok()
+                })
+            } else {
+                self.root_device(&path)
+            };
+            match (directory(), device) {
                 (Ok(directory), Some(root_device))
                     if directory.device != root_device =>
                 {
@@ -413,7 +439,7 @@ impl WalkContext {
                 }
                 (Err(error), _) => {
                     self.progress.record_error(&path, error);
-                    return Classified::Skipped;
+                    return Classified::Unreadable;
                 }
                 _ => {}
             }
@@ -440,7 +466,7 @@ impl WalkContext {
                 }
                 Err(error) => {
                     self.progress.record_error(path, &error);
-                    Classified::Skipped
+                    Classified::Unreadable
                 }
             };
         }
@@ -451,6 +477,7 @@ impl WalkContext {
                 // A dangling link is normal, not an error worth counting.
                 if error.kind() != io::ErrorKind::NotFound {
                     self.progress.record_error(path, &error);
+                    return Classified::Unreadable;
                 }
                 return Classified::Skipped;
             }
@@ -751,8 +778,10 @@ enum Classified {
     Subdirectory { path: PathBuf, name: Box<str> },
     /// A leaf that contributes size.
     Entry(Node),
-    /// Filtered out, unreadable, or a symlink we chose not to follow.
+    /// Filtered out, or a symlink we chose not to follow.
     Skipped,
+    /// Collection failed, rather than an intentional filter.
+    Unreadable,
 }
 
 /// One directory being walked, plus the counter that decides when it is done.
@@ -858,6 +887,9 @@ fn scan_on_pool(
     }
     let resolved = root.canonicalize().ok();
     let canonical = resolved.as_deref().unwrap_or(root);
+    if let Some(data) = crate::space::data_services_only(root, canonical) {
+        let _ = context.data_services.set(data);
+    }
     let mut never = crate::space::never_scanned(root, canonical);
     // Hidden-entry and depth filters can leave an alias as the only route
     // to files. Keep every mount view when either filter is active.
@@ -1084,6 +1116,13 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
                 }
                 match entry {
                     Ok(mut entry) => {
+                        if context.data_services.get() == Some(&dir.path)
+                            && !crate::macos_services::is_service_name(
+                                entry.name(),
+                            )
+                        {
+                            continue;
+                        }
                         match context.classify(&dir.path, &mut entry) {
                             Classified::Subdirectory { path, name } => {
                                 tally.dirs += 1;
@@ -1099,6 +1138,9 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
                                 leaves.push(node);
                             }
                             Classified::Skipped => {}
+                            Classified::Unreadable => {
+                                dir.read_error.store(true, Ordering::Relaxed);
+                            }
                         }
                         if tally.files + tally.dirs >= TALLY_EVERY {
                             tally.flush(&context.progress);
@@ -1106,6 +1148,7 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
                     }
                     Err(error) => {
                         context.progress.record_error(&dir.path, &error);
+                        dir.read_error.store(true, Ordering::Relaxed);
                     }
                 }
             }
@@ -1387,6 +1430,47 @@ mod tests {
             })
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_second_data_mount_counts_private_stores_without_its_user_aliases() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        let ordinary = write(root, "Users/me/document", 100);
+        let data = root.join("Data");
+        fs::create_dir_all(data.join("Users/me")).expect("mkdir");
+        fs::hard_link(&ordinary, data.join("Users/me/document"))
+            .expect("an alias for the same file");
+        let history = write(root, "Data/.fseventsd/events", 1234);
+        let index = write(root, "Data/.Spotlight-V100/index", 4567);
+        let duplicate = data.join(".Spotlight-V100/another-name");
+        fs::hard_link(&index, &duplicate).expect("hardlink inside a store");
+        write(root, "Data/not-a-private-store/blob", 9999);
+        let context = Arc::new(WalkContext {
+            known: None,
+            options: ScanOptions::default(),
+            progress: Arc::new(ScanProgress::default()),
+            root_device: Mutex::new(None),
+            foreign_mounts: OnceLock::new(),
+            never_scanned: OnceLock::new(),
+            data_services: OnceLock::from(data),
+            data_device: OnceLock::new(),
+            visited_dirs: Mutex::new(FxHashSet::default()),
+            root: Mutex::new(None),
+            volume: OnceLock::new(),
+        });
+        let tree = scan_blocking(root, &context).expect("scan");
+        let size = |path: &Path| {
+            allocated_bytes(&fs::metadata(path).expect("metadata"))
+                .expect("Unix allocation")
+        };
+        assert_eq!(tree.bytes, size(&ordinary) + size(&history) + size(&index));
+        let data = child(&tree, "Data");
+        assert_eq!(data.children.len(), 2);
+        assert_eq!(child(data, ".fseventsd").bytes, size(&history));
+        assert_eq!(child(data, ".Spotlight-V100").bytes, size(&index));
+        assert_eq!(context.progress.snapshot().errors, 0);
+    }
+
     #[test]
     fn fixed_worker_pools_change_size_without_reinitializing_rayon() {
         let cpus = thread::available_parallelism().map_or(1, usize::from);
@@ -1450,6 +1534,8 @@ mod tests {
             root_device: Mutex::new(None),
             foreign_mounts: OnceLock::new(),
             never_scanned: OnceLock::new(),
+            data_services: OnceLock::new(),
+            data_device: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
@@ -1730,6 +1816,8 @@ mod tests {
             root_device: Mutex::new(None),
             foreign_mounts: OnceLock::new(),
             never_scanned: OnceLock::new(),
+            data_services: OnceLock::new(),
+            data_device: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
@@ -1737,12 +1825,22 @@ mod tests {
         let tree = scan_blocking(root, &context).expect("scan still succeeds");
         let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o700));
 
-        assert_eq!(tree.bytes, 11);
+        assert_eq!(tree.bytes, if readable.is_err() { 11 } else { 33 });
         let node = child(&tree, "locked");
-        if matches!(readable, Ok(false)) {
+        if readable.is_err() {
             assert!(node.read_error);
+            assert!(tree.read_error, "unknown contents affect ancestor totals");
             assert!(progress.snapshot().errors >= 1);
             assert!(!progress.snapshot().messages.is_empty());
+            assert_eq!(
+                crate::macos_services::usage(
+                    root,
+                    &tree,
+                    &context.options,
+                    &locked
+                ),
+                crate::macos_services::Usage::Unavailable
+            );
         }
     }
 
