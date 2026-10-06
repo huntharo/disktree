@@ -82,6 +82,11 @@ pub struct Plan {
     reclaim: u64,
     /// Bytes the targets free on other volumes; see [`Self::foreign`].
     foreign: u64,
+    /// Attribution from the same mount-table read that judged the guards.
+    attribution: Vec<crate::space::Attribution>,
+    /// Clone estimates are separate from listed allocation and its volumes.
+    reclaimable_bytes: Option<u64>,
+    reclaim_estimate: Option<u64>,
 }
 
 impl Plan {
@@ -97,7 +102,35 @@ impl Plan {
     /// disk mounted under the root can be marked — gives its space back
     /// there, so projecting it here would lend one disk another's bytes.
     pub const fn reclaim(&self) -> u64 {
-        self.reclaim
+        match self.reclaim_estimate {
+            Some(bytes) => bytes,
+            None => self.reclaim,
+        }
+    }
+
+    /// Estimated savings across all targets, independent of the volume meter.
+    pub fn reclaimable_bytes(&self) -> u64 {
+        self.reclaimable_bytes.unwrap_or_else(|| self.bytes())
+    }
+
+    /// Apply scan-derived savings without lending another volume's space to
+    /// this one's meter. Missing nodes contribute no unmeasured saving.
+    pub fn estimate_reclaim(
+        &mut self,
+        estimate: impl Fn(&Target) -> Option<u64>,
+    ) {
+        let mut total = 0_u64;
+        let mut scanned = 0_u64;
+        for (target, attribution) in self.targets.iter().zip(&self.attribution)
+        {
+            let bytes = estimate(target).unwrap_or(0).min(target.bytes);
+            total = total.saturating_add(bytes);
+            if *attribution == crate::space::Attribution::Scanned {
+                scanned = scanned.saturating_add(bytes);
+            }
+        }
+        self.reclaimable_bytes = Some(total);
+        self.reclaim_estimate = Some(scanned);
     }
 
     /// Bytes the targets free on other volumes, which the meter leaves out.
@@ -185,11 +218,13 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
     // the scanned volume may be shown against its free space.
     for target in &plan.targets {
         let bytes = target.bytes;
-        match crate::space::attribution(
+        let attribution = crate::space::attribution(
             mounts.mounts.as_deref(),
             &plan.root,
             &target.path,
-        ) {
+        );
+        plan.attribution.push(attribution);
+        match attribution {
             crate::space::Attribution::Scanned => plan.reclaim += bytes,
             crate::space::Attribution::Other => plan.foreign += bytes,
             crate::space::Attribution::Unknown => {}
@@ -1802,6 +1837,16 @@ mod tests {
         assert_eq!(plan.reclaim(), 100, "the Btrfs subvolume is this disk");
         assert_eq!(plan.foreign(), 600, "another disk, and a snapshot");
         assert_eq!(plan.unattributed(), 0);
+        let mut estimated = plan;
+        estimated.estimate_reclaim(|target| Some(target.bytes / 2));
+        assert_eq!(estimated.reclaimable_bytes(), 350);
+        assert_eq!(estimated.reclaim(), 50, "only this volume's estimate");
+        assert_eq!(estimated.foreign(), 600, "listed foreign allocation");
+        assert_eq!(
+            estimated.unattributed(),
+            0,
+            "sharing is not an unknown volume"
+        );
 
         // A mark inside another is removed with it, so its bytes are counted
         // once here as they are in the total.
@@ -1829,6 +1874,15 @@ mod tests {
         assert_eq!(plan.reclaim(), 0);
         assert_eq!(plan.foreign(), 0);
         assert_eq!(plan.unattributed(), 50, "no saving may be claimed");
+        let mut estimated = plan;
+        estimated.estimate_reclaim(|_| Some(25));
+        assert_eq!(estimated.reclaimable_bytes(), 25);
+        assert_eq!(
+            estimated.reclaim(),
+            0,
+            "unplaced estimates stay off the meter"
+        );
+        assert_eq!(estimated.unattributed(), 50);
     }
 
     #[test]

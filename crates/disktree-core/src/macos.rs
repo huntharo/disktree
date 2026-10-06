@@ -8,12 +8,15 @@
 
 #![allow(
     unsafe_code,
-    reason = "getattrlistbulk, which neither std nor rustix wraps; each block \
+    reason = "Darwin attribute calls, which neither std nor rustix wraps; each block \
               says why it is sound"
 )]
 
 use std::cell::RefCell;
-use std::ffi::{OsStr, c_int, c_void};
+use std::ffi::{CString, OsStr, c_int, c_void};
+use std::fs::Metadata;
+use std::os::unix::fs::MetadataExt as _;
+
 use std::io;
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
@@ -21,8 +24,16 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
+use crate::sharing::CloneInfo;
+
 /// Bytes the kernel fills per call: some hundreds of entries.
 const BUFFER_BYTES: usize = 64 * 1024;
+
+const REFCNT: u32 = 0x1000;
+const MAY_SHARE: u64 = 0x1 | 0x40;
+const EXTENDED: u32 = libc::FSOPT_ATTR_CMN_EXTENDED;
+const RETURNED: u32 = libc::ATTR_CMN_RETURNED_ATTRS;
+const HINTS: u32 = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
 
 // From <sys/attr.h> and <sys/vnode.h>, which the libc crate does not cover.
 const ATTR_BIT_MAP_COUNT: u16 = 5;
@@ -116,6 +127,7 @@ pub struct Entry {
     inode: u64,
     links: u32,
     flags: u32,
+    hints: Option<(u64, u64)>,
 }
 
 impl Entry {
@@ -181,6 +193,21 @@ impl Entry {
         matches!(self.kind, Kind::Directory) && self.flags & SF_DATALESS != 0
     }
 
+    /// Only clone candidates pay for private-size reads; ordinary metadata
+    /// and identity remain the values returned by the bulk listing.
+    pub fn clone_info(&self, dir: &Path) -> Option<Box<CloneInfo>> {
+        let (id, flags) = self.hints?;
+        if self.kind != Kind::File || flags & MAY_SHARE == 0 {
+            return None;
+        }
+        Some(Box::new(private_info(
+            &self.path(dir),
+            self.device,
+            self.inode,
+            id,
+        )))
+    }
+
     fn named(name: &[u8]) -> (Box<str>, Option<Box<OsStr>>) {
         match std::str::from_utf8(name) {
             Ok(text) => (text.into(), None),
@@ -210,6 +237,7 @@ impl Entry {
             inode: stat.st_ino,
             links: u32::from(stat.st_nlink),
             flags: stat.st_flags,
+            hints: None,
         }
     }
 }
@@ -226,11 +254,12 @@ pub struct ReadDir {
     /// Where the next of them starts.
     offset: usize,
     done: bool,
+    clones: bool,
 }
 
 /// List `dir`, with each entry's size, identity and age. A link at `dir`
 /// itself is followed, as `std::fs::read_dir` follows it.
-pub fn read_dir(dir: &Path) -> io::Result<ReadDir> {
+pub fn read_dir(dir: &Path, clones: bool) -> io::Result<ReadDir> {
     let fd = rustix::fs::open(
         dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -245,6 +274,7 @@ pub fn read_dir(dir: &Path) -> io::Result<ReadDir> {
         remaining: 0,
         offset: 0,
         done: false,
+        clones,
     })
 }
 
@@ -305,7 +335,7 @@ impl ReadDir {
             volattr: 0,
             dirattr: 0,
             fileattr: FILE_ATTRIBUTES,
-            forkattr: 0,
+            forkattr: if self.clones { HINTS } else { 0 },
         };
         loop {
             // SAFETY: the descriptor is an open directory owned by `self`;
@@ -318,13 +348,25 @@ impl ReadDir {
                     &raw mut request,
                     buffer.as_mut_ptr().cast(),
                     BUFFER_BYTES,
-                    0,
+                    if self.clones { u64::from(EXTENDED) } else { 0 },
                 )
             };
             if let Ok(count) = u32::try_from(count) {
                 return Ok(count);
             }
             let error = io::Error::last_os_error();
+            // Optional clone hints must not disable ordinary enumeration on
+            // volumes or kernels that reject extended attributes.
+            if self.clones
+                && matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOTSUP)
+                )
+            {
+                self.clones = false;
+                request.forkattr = 0;
+                continue;
+            }
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
             }
@@ -362,7 +404,7 @@ impl ReadDir {
         let common = cursor.u32()?;
         cursor.at += 8;
         let file = cursor.u32()?;
-        cursor.at += 4;
+        let extended = cursor.u32()?;
         let error = if common & ATTR_CMN_ERROR == 0 {
             0
         } else {
@@ -374,7 +416,7 @@ impl ReadDir {
             return Ok((Err(error), length));
         }
         let entry = if common & MEASURED == MEASURED {
-            cursor.entry(file, name)?
+            cursor.entry(file, extended, name)?
         } else {
             None
         };
@@ -437,18 +479,28 @@ impl<'a> Cursor<'a> {
         let offset = isize::try_from(self.u32()?.cast_signed())
             .map_err(|_| malformed())?;
         let length = self.u32()? as usize;
-        reference
+        let name = reference
             .checked_add_signed(offset)
             .zip(length.checked_sub(1))
             .and_then(|(start, length)| {
                 self.record.get(start..start.checked_add(length)?)
             })
-            .ok_or_else(malformed)
+            .ok_or_else(malformed)?;
+        if name.is_empty() || name == b"." || name == b".." || name.contains(&0)
+        {
+            return Err(malformed());
+        }
+        Ok(name)
     }
 
     /// The attributes after the name, every one of them asked for; `None`
     /// for a file whose sizes the file system left out.
-    fn entry(&mut self, file: u32, name: &[u8]) -> io::Result<Option<Entry>> {
+    fn entry(
+        &mut self,
+        file: u32,
+        extended: u32,
+        name: &[u8],
+    ) -> io::Result<Option<Entry>> {
         let device = self.u32()?.cast_signed();
         let kind = match self.u32()? {
             VDIR => Kind::Directory,
@@ -472,6 +524,17 @@ impl<'a> Cursor<'a> {
         } else {
             return Ok(None);
         };
+        let clone_id = if extended & libc::ATTR_CMNEXT_CLONEID != 0 {
+            Some(self.u64()?)
+        } else {
+            None
+        };
+        let clone_flags = if extended & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
+            Some(self.u64()?)
+        } else {
+            None
+        };
+        let hints = clone_id.zip(clone_flags);
         let (name, exact) = Entry::named(name);
         Ok(Some(Entry {
             name,
@@ -484,6 +547,7 @@ impl<'a> Cursor<'a> {
             inode,
             links,
             flags,
+            hints,
         }))
     }
 }
@@ -496,7 +560,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn listed(dir: &Path) -> Vec<Entry> {
-        let mut entries: Vec<Entry> = read_dir(dir)
+        let mut entries: Vec<Entry> = read_dir(dir, false)
             .expect("list")
             .collect::<io::Result<_>>()
             .expect("entries");
@@ -578,6 +642,16 @@ mod tests {
         let listed: Vec<Fields> = listed(root).iter().map(fields).collect();
         let stated: Vec<Fields> = stated(root).iter().map(fields).collect();
         assert_eq!(listed, stated);
+        // Adding clone hints must preserve ordinary metadata, including
+        // resource forks and hardlink identity in the same bulk record.
+        let mut clone_entries: Vec<Entry> = read_dir(root, true)
+            .expect("list with clone hints")
+            .collect::<io::Result<_>>()
+            .expect("entries");
+        clone_entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let clone_fields: Vec<Fields> =
+            clone_entries.iter().map(fields).collect();
+        assert_eq!(clone_fields, stated);
         let forked = listed.iter().find(|leaf| leaf.0 == "forked").unwrap();
         assert_eq!(forked.2, 4, "the data fork's length");
         assert!(forked.3 >= 20_000, "the fork's blocks: {}", forked.3);
@@ -617,7 +691,274 @@ mod tests {
     #[test]
     fn a_missing_directory_is_an_error() {
         let temp = TempDir::new().expect("tempdir");
-        let error = read_dir(&temp.path().join("gone")).expect_err("missing");
+        let error =
+            read_dir(&temp.path().join("gone"), false).expect_err("missing");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+const fn clone_attrs(common: u32, file: u32, extended: u32) -> libc::attrlist {
+    libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: RETURNED | common,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: file,
+        forkattr: extended,
+    }
+}
+
+fn private_info(path: &Path, device: u64, inode: u64, id: u64) -> CloneInfo {
+    let mut info = CloneInfo {
+        device,
+        id,
+        ..CloneInfo::default()
+    };
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return info;
+    };
+    // Re-read identity alongside private size: a replacement between the
+    // listing/stat and this call must not receive the old file's estimate.
+    let mut request = clone_attrs(
+        libc::ATTR_CMN_FILEID,
+        libc::ATTR_FILE_DATAALLOCSIZE,
+        libc::ATTR_CMNEXT_PRIVATESIZE | HINTS | REFCNT,
+    );
+    let mut buffer = [0_u8; 96];
+    loop {
+        // SAFETY: valid NUL-terminated path, initialized ABI request and
+        // writable buffer. NOFOLLOW never asks a symlink target for data.
+        let result = unsafe {
+            libc::getattrlist(
+                path.as_ptr(),
+                (&raw mut request).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                EXTENDED | libc::FSOPT_NOFOLLOW | libc::FSOPT_PACK_INVAL_ATTRS,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        if io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+            && request.forkattr & REFCNT != 0
+        {
+            request.forkattr &= !REFCNT;
+            continue;
+        }
+        return info;
+    }
+    let Some(length) = clone_read_u32(&buffer, 0) else {
+        return info;
+    };
+    let Some(buffer) = buffer.get(..length as usize) else {
+        return info;
+    };
+    let common = clone_read_u32(buffer, 4).unwrap_or(0);
+    let files = clone_read_u32(buffer, 16).unwrap_or(0);
+    let extended = clone_read_u32(buffer, 20).unwrap_or(0);
+    if common & libc::ATTR_CMN_FILEID == 0
+        || clone_read_u64(buffer, 24) != Some(inode)
+    {
+        return info;
+    }
+    // Packed order: fileid, dataallocsize, privatesize, cloneid, flags, refcnt.
+    if extended & libc::ATTR_CMNEXT_CLONEID == 0
+        || clone_read_u64(buffer, 48) != Some(id)
+    {
+        return info;
+    }
+    if extended & libc::ATTR_CMNEXT_PRIVATESIZE != 0 {
+        info.private_bytes = clone_read_u64(buffer, 40);
+    }
+    if files & libc::ATTR_FILE_DATAALLOCSIZE != 0 {
+        info.data_bytes = clone_read_u64(buffer, 32).unwrap_or(0);
+    }
+    if extended & REFCNT != 0 {
+        info.references = clone_read_u32(buffer, 64).unwrap_or(0);
+    }
+    info
+}
+
+fn clone_read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+fn clone_read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_ne_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// Exceptional path for followed symlinks; ordinary entries use bulk hints.
+pub fn clone_info(path: &Path, meta: &Metadata) -> Option<Box<CloneInfo>> {
+    let path_c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut request = clone_attrs(0, 0, HINTS);
+    let mut buffer = [0_u8; 40];
+    // SAFETY: valid path, ABI request and writable buffer of the stated size.
+    let result = unsafe {
+        libc::getattrlist(
+            path_c.as_ptr(),
+            (&raw mut request).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            EXTENDED | libc::FSOPT_NOFOLLOW | libc::FSOPT_PACK_INVAL_ATTRS,
+        )
+    };
+    if result != 0
+        || clone_read_u32(&buffer, 20)? & HINTS != HINTS
+        || clone_read_u64(&buffer, 32)? & MAY_SHARE == 0
+    {
+        return None;
+    }
+    Some(Box::new(private_info(
+        path,
+        meta.dev(),
+        meta.ino(),
+        clone_read_u64(&buffer, 24)?,
+    )))
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::*;
+    use crate::scan::{ScanOptions, scan};
+    use std::fs;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::process::Command;
+
+    fn fixture() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("original");
+        fs::write(&source, vec![0x5a; 8 * 1024 * 1024]).expect("write");
+        assert!(
+            Command::new("cp")
+                .arg("-c")
+                .arg(&source)
+                .arg(temp.path().join("clone"))
+                .status()
+                .expect("cp -c")
+                .success()
+        );
+        temp
+    }
+
+    #[test]
+    fn real_clones_keep_listed_bytes_and_report_sharing() {
+        let temp = fixture();
+        let tree = scan(temp.path(), ScanOptions::default()).expect("scan");
+        assert_eq!(tree.bytes, 16 * 1024 * 1024);
+        assert_eq!(tree.sharing().files, 2, "{tree:#?}");
+        assert_eq!(tree.sharing().bytes, tree.bytes);
+        assert_eq!(tree.sharing().duplicate_bytes, 8 * 1024 * 1024);
+        assert_eq!(tree.sharing().private_bytes, 0);
+        assert_eq!(tree.sharing().unknown_files, 0);
+        let baseline = scan(
+            temp.path(),
+            ScanOptions {
+                apfs_clone_metadata: false,
+                ..ScanOptions::default()
+            },
+        )
+        .expect("scan without clone metadata");
+        assert_eq!(baseline.bytes, tree.bytes);
+        assert_eq!(baseline.sharing().files, 0);
+        let apparent = scan(
+            temp.path(),
+            ScanOptions {
+                apparent_size: true,
+                ..ScanOptions::default()
+            },
+        )
+        .expect("apparent scan");
+        assert_eq!(apparent.sharing().files, 0);
+    }
+
+    #[test]
+    fn modified_clones_keep_private_bytes_and_hardlinks_are_not_clones() {
+        let temp = fixture();
+        let clone = temp.path().join("clone");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&clone)
+            .expect("open");
+        file.seek(SeekFrom::Start(1024 * 1024)).expect("seek");
+        file.write_all(&[1; 4096]).expect("write");
+        file.sync_all().expect("sync");
+        fs::hard_link(&clone, temp.path().join("linked")).expect("hardlink");
+        std::os::unix::fs::symlink(&clone, temp.path().join("symlink"))
+            .expect("symlink");
+        for follow_links in [false, true] {
+            let tree = scan(
+                temp.path(),
+                ScanOptions {
+                    follow_links,
+                    ..ScanOptions::default()
+                },
+            )
+            .expect("scan");
+            assert_eq!(tree.sharing().files, 2, "{tree:#?}");
+            assert!(tree.sharing().private_bytes >= 4096);
+            assert!(tree.sharing().private_bytes < tree.sharing().bytes);
+            assert_eq!(tree.sharing().duplicate_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn unreadable_private_metadata_is_unknown_not_full_allocation() {
+        let temp = fixture();
+        let source = temp.path().join("original");
+        let meta = fs::metadata(&source).expect("metadata");
+        let info = private_info(
+            &temp.path().join("missing"),
+            meta.dev(),
+            meta.ino(),
+            42,
+        );
+        assert_eq!(info.private_bytes, None);
+        assert_eq!(info.references, 0);
+    }
+
+    #[test]
+    fn malformed_bulk_names_and_records_are_rejected() {
+        assert!(
+            Cursor {
+                record: &[],
+                at: 24
+            }
+            .name()
+            .is_err()
+        );
+        let mut record = vec![0_u8; 64];
+        record[4..8]
+            .copy_from_slice(&(RETURNED | libc::ATTR_CMN_NAME).to_ne_bytes());
+        record[24..28].copy_from_slice(&8_u32.to_ne_bytes());
+        record[28..32].copy_from_slice(&3_u32.to_ne_bytes());
+        record[32..35].copy_from_slice(b"ok\0");
+        assert_eq!(
+            Cursor {
+                record: &record,
+                at: 24
+            }
+            .name()
+            .expect("name"),
+            b"ok"
+        );
+        record[32..35].copy_from_slice(b"..\0");
+        assert!(
+            Cursor {
+                record: &record,
+                at: 24
+            }
+            .name()
+            .is_err()
+        );
+        record[24..28].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(
+            Cursor {
+                record: &record,
+                at: 24
+            }
+            .name()
+            .is_err()
+        );
     }
 }

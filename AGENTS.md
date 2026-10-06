@@ -62,11 +62,11 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 ## Invariants
 
 1. **Sizes come from `st_blocks * 512` unless apparent size was asked for.**
-   That is the number that comes back when a file is deleted. On macOS the
-   directory listing reports it and `st_size` for a whole buffer of entries:
-   every fork's allocation, and the data fork's length; see `macos.rs`. On
-   Windows it is the allocation the directory listing reports; see
-   `windows.rs`. An
+   APFS clones can share those blocks; private-byte estimates are reported
+   separately without changing tile weights. On macOS the directory listing
+   reports every fork's allocation and the data fork's length in bulk; see
+   `macos.rs`. On Windows it is the allocation the directory listing reports;
+   see `windows.rs`. An
    elevated scan of a whole NTFS drive reads it from the master file table
    instead, keeping the walk's rules for hidden entries, links, cloud
    folders and depth; see `mft.rs`. That path counts every stream's
@@ -119,6 +119,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | what macOS lists and measures in bulk | `crates/disktree-core/src/macos.rs` — `unsafe` for `getattrlistbulk` |
 | what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — `unsafe` for Win32 |
 | reading a whole NTFS drive from its file table | `crates/disktree-core/src/mft.rs` |
+| APFS clone hints and private-size system calls | `crates/disktree-core/src/macos.rs` — isolated `unsafe` |
+| clone sharing totals and conservative savings | `crates/disktree-core/src/sharing.rs` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |

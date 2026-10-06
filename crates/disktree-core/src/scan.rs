@@ -42,6 +42,8 @@ pub struct ScanOptions {
     /// what `ls -l` shows; blocks are what the volume actually spends, which is
     /// what a disk-space tool normally wants.
     pub apparent_size: bool,
+    /// Read APFS clone hints and private sizes on macOS.
+    pub apfs_clone_metadata: bool,
     /// Follow symlinks. Off by default: a home directory is full of links, and
     /// following them double-counts.
     pub follow_links: bool,
@@ -69,6 +71,7 @@ impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             apparent_size: false,
+            apfs_clone_metadata: true,
             follow_links: false,
             include_hidden: true,
             one_filesystem: true,
@@ -353,7 +356,7 @@ impl WalkContext {
             }
             Listing::Leaf(kind) => kind,
         };
-        match entry.facts(self.options.apparent_size) {
+        match entry.facts(dir, self.options.apparent_size) {
             Ok(facts) => self.leaf(entry.take_name(), kind, &facts),
             Err(error) => {
                 self.progress.record_error(&entry.entry_path(dir), &error);
@@ -477,6 +480,12 @@ impl WalkContext {
         // What the link leads to, so a file that is also reached directly is
         // charged once.
         facts.identity = identity_of(path, &meta);
+        #[cfg(target_os = "macos")]
+        if self.options.apfs_clone_metadata && !self.options.apparent_size {
+            facts.clone_info = fs::canonicalize(path)
+                .ok()
+                .and_then(|target| crate::macos::clone_info(&target, &meta));
+        }
         self.leaf(name, kind_of(&meta, meta.file_type()), &facts)
     }
 
@@ -512,7 +521,7 @@ trait Listed {
     fn take_name(&mut self) -> Box<str>;
     fn listing(&self) -> io::Result<Listing>;
     /// Size, identity and age of a leaf.
-    fn facts(&self, apparent_size: bool) -> io::Result<Facts>;
+    fn facts(&self, _dir: &Path, apparent_size: bool) -> io::Result<Facts>;
     /// What a directory is, read before the walk enters it.
     fn directory(&self) -> io::Result<Directory>;
     /// Hidden by an attribute rather than by a leading dot: on Windows,
@@ -555,6 +564,7 @@ struct Facts {
     /// The file may have another name the walk could meet: its identity is
     /// worth keeping for hardlink de-duplication.
     shared: bool,
+    clone_info: Option<Box<crate::sharing::CloneInfo>>,
 }
 
 impl Facts {
@@ -564,6 +574,7 @@ impl Facts {
             identity: file_identity(meta),
             modified: modified_seconds(meta),
             shared: shares_inode(meta),
+            clone_info: None,
         }
     }
 }
@@ -602,10 +613,9 @@ impl Listed for Named {
         })
     }
 
-    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
-        self.entry
-            .metadata()
-            .map(|meta| Facts::of(&meta, apparent_size))
+    fn facts(&self, _dir: &Path, apparent_size: bool) -> io::Result<Facts> {
+        let meta = self.entry.metadata()?;
+        Ok(Facts::of(&meta, apparent_size))
     }
 
     fn directory(&self) -> io::Result<Directory> {
@@ -639,7 +649,7 @@ impl Listed for crate::macos::Entry {
         })
     }
 
-    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+    fn facts(&self, dir: &Path, apparent_size: bool) -> io::Result<Facts> {
         Ok(Facts {
             size: if apparent_size {
                 self.apparent()
@@ -649,6 +659,11 @@ impl Listed for crate::macos::Entry {
             identity: Some(self.identity()),
             modified: self.modified(),
             shared: self.shared(),
+            clone_info: if apparent_size {
+                None
+            } else {
+                self.clone_info(dir)
+            },
         })
     }
 
@@ -682,7 +697,7 @@ impl Listed for crate::windows::Entry {
         })
     }
 
-    fn facts(&self, apparent_size: bool) -> io::Result<Facts> {
+    fn facts(&self, _dir: &Path, apparent_size: bool) -> io::Result<Facts> {
         Ok(Facts {
             size: if apparent_size {
                 self.apparent()
@@ -694,6 +709,7 @@ impl Listed for crate::windows::Entry {
             // The listing has no link count; a file id is free here, so
             // every file keeps one.
             shared: true,
+            clone_info: None,
         })
     }
 
@@ -717,8 +733,10 @@ impl Listed for crate::windows::Entry {
 fn list(
     path: &Path,
     _volume: Option<u64>,
+    _clones: bool,
 ) -> io::Result<impl Iterator<Item = io::Result<Named>>> {
-    Ok(fs::read_dir(path)?.map(|entry| {
+    let entries = fs::read_dir(path)?;
+    Ok(entries.map(|entry| {
         entry.map(|entry| Named {
             name: entry.file_name().into_string().map_or_else(
                 |raw| raw.to_string_lossy().into(),
@@ -733,14 +751,16 @@ fn list(
 fn list(
     path: &Path,
     _volume: Option<u64>,
+    clones: bool,
 ) -> io::Result<crate::macos::ReadDir> {
-    crate::macos::read_dir(path)
+    crate::macos::read_dir(path, clones)
 }
 
 #[cfg(windows)]
 fn list(
     path: &Path,
     volume: Option<u64>,
+    _clones: bool,
 ) -> io::Result<crate::windows::ReadDir> {
     crate::windows::read_dir(path, volume)
 }
@@ -813,6 +833,8 @@ impl PendingDir {
             files: 0,
             dirs: 1,
             inode: None,
+            clone_info: None,
+            sharing: None,
             read_error: self.read_error.load(Ordering::Relaxed),
             modified: 0,
             category: crate::classify::Category::Other,
@@ -1076,7 +1098,11 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
     let mut leaves: Vec<Node> = Vec::new();
     let mut tally = Tally::default();
 
-    match list(&dir.path, context.volume.get().copied()) {
+    match list(
+        &dir.path,
+        context.volume.get().copied(),
+        context.options.apfs_clone_metadata && !context.options.apparent_size,
+    ) {
         Ok(entries) => {
             for entry in entries {
                 if context.cancelled() {
@@ -1205,6 +1231,7 @@ fn leaf_node(
             .and_then(|(device, file)| Some((device, NonZeroU64::new(file)?)));
     }
     node.modified = facts.modified;
+    node.clone_info.clone_from(&facts.clone_info);
     node
 }
 
