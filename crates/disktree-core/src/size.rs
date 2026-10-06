@@ -18,7 +18,9 @@ pub fn human_bytes_short(bytes: u64) -> String {
 fn scale(bytes: u64) -> Scaled {
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < BYTE_UNITS.len() {
+    // Step up from 1023.5, not 1024: no decimal is shown at that size, so
+    // anything above it would print as `1024 KiB` instead of `1.0 MiB`.
+    while value >= 1023.5 && unit + 1 < BYTE_UNITS.len() {
         value /= 1024.0;
         unit += 1;
     }
@@ -51,11 +53,13 @@ impl Scaled {
 /// `1.2k`, `3.4M`, `812`: file counts, which grow past a million quickly.
 pub fn human_count(count: u64) -> String {
     let value = count as f64;
+    // Each bound sits where the one decimal would round up to 1000.0, so
+    // 999,999 reads `1.0M`, not `1000.0k`.
     if count < 10_000 {
         format!("{count}")
-    } else if value < 1_000_000.0 {
+    } else if value < 999_950.0 {
         format!("{:.1}k", value / 1_000.0)
-    } else if value < 1_000_000_000.0 {
+    } else if value < 999_950_000.0 {
         format!("{:.1}M", value / 1_000_000.0)
     } else {
         format!("{:.1}G", value / 1_000_000_000.0)
@@ -117,6 +121,18 @@ mod tests {
         assert_eq!(human_count(9_999), "9999");
         assert_eq!(human_count(12_000), "12.0k");
         assert_eq!(human_count(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn a_value_that_rounds_up_to_the_next_unit_is_shown_in_it() {
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024 * 1024 - 1), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024 - 1), "1.0 GiB");
+        assert_eq!(human_bytes_short(1024 * 1024 - 1), "1.0MiB");
+        assert_eq!(human_bytes(1023 * 1024), "1023 KiB");
+        assert_eq!(human_count(999_949), "999.9k");
+        assert_eq!(human_count(999_999), "1.0M");
+        assert_eq!(human_count(999_999_999), "1.0G");
     }
 
     #[test]
