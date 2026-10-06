@@ -6,7 +6,7 @@
 
 use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
-use disktree_core::removal::{RemovalMode, Target};
+use disktree_core::removal::{Plan, RemovalMode, Target};
 use disktree_core::size::human_bytes;
 use disktree_core::tree::Metric;
 use gpui_kit::base::CheckboxState;
@@ -1212,7 +1212,7 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
     let tree = app.tree();
     let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
     let files = tree.map_or(app.progress.files, |node| node.files);
-    let dirs = tree.map_or(app.progress.dirs, |node| node.dirs);
+    let dirs = tree.map_or(app.progress.dirs, |node| u64::from(node.dirs));
     let errors = app.progress.errors;
     div()
         .flex()
@@ -2066,7 +2066,10 @@ fn disk_section(
                 .child("Free space is not available here"),
         );
     };
-    let reclaiming = app.plan().reclaimable_bytes();
+    let plan = app.plan();
+    // The meter measures this volume, so it projects only the marks whose
+    // bytes come back to it; the rest is said, never added.
+    let reclaiming = plan.reclaim();
     let after = space_info.after_removing(reclaiming);
     let highlight = palette::highlight(theme);
     let (number, unit) =
@@ -2137,6 +2140,14 @@ fn disk_section(
                     ),
             ),
     );
+    if let Some(left_out) = not_counted(&plan) {
+        section = section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!("not counted here: {left_out}")),
+        );
+    }
     section
         .child(
             div()
@@ -2152,6 +2163,24 @@ fn disk_section(
             (!app.marks.is_empty())
                 .then(|| review_button(app, reclaiming, theme, cx)),
         )
+}
+
+/// What the volume meter leaves out, and why, when it leaves anything out:
+/// bytes marked on another volume come back there, and bytes no volume can
+/// be found for are not claimed at all. `None` when every marked byte is
+/// this volume's, which is the usual case.
+fn not_counted(plan: &Plan) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if plan.foreign() > 0 {
+        parts.push(format!("{} on other volumes", human_bytes(plan.foreign())));
+    }
+    if plan.unattributed() > 0 {
+        parts.push(format!(
+            "{} could not be placed",
+            human_bytes(plan.unattributed())
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// The way to the review screen, where the saving is: it says what is
@@ -2705,7 +2734,13 @@ fn review_summary(
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
-    let reclaiming = plan.reclaimable_bytes();
+    // What comes back to the volume on screen, which is all its meter can
+    // project; the totals below say what the removal does in full.
+    let reclaiming = plan.reclaim();
+    // The part of the saving that lands elsewhere, said rather than added to
+    // this volume's projection, so the two numbers cannot be confused.
+    let left_out = not_counted(plan)
+        .map(|left_out| widgets::row("Not counted here", left_out, cx));
     let trash = app.trash_backend.is_available();
 
     // One silhouette for one either-or choice, reversible option first.
@@ -2797,9 +2832,10 @@ fn review_summary(
                     } else {
                         "Estimated space freed"
                     },
-                    human_bytes(reclaiming),
+                    human_bytes(plan.reclaimable_bytes()),
                     cx,
-                )),
+                ))
+                .children(left_out),
         );
 
     if cfg!(target_os = "macos") {
@@ -3444,9 +3480,10 @@ fn node_card(
                     "{} files · {} dirs · {} direct",
                     widgets::human_count(node.files),
                     widgets::human_count(
-                        node.dirs.saturating_sub(u64::from(node.is_dir()))
+                        u64::from(node.dirs)
+                            .saturating_sub(u64::from(node.is_dir()))
                     ),
-                    human_bytes(node.own_bytes)
+                    human_bytes(node.own_bytes())
                 )),
         );
 

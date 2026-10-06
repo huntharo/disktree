@@ -185,7 +185,8 @@ mod tests {
         root.children =
             vec![clone("a", 1, 1, Some(0)), clone("b", 1, 1, Some(0))];
         for node in &mut root.children {
-            node.inode = Some((1, 123));
+            node.inode =
+                Some((1, std::num::NonZeroU64::new(123).expect("inode")));
         }
         aggregate_deduped(&mut root, Metric::Bytes, &Seen::new());
         assert_eq!(root.sharing().files, 1);

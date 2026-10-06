@@ -1769,18 +1769,10 @@ impl Disktree {
     pub fn plan(&self) -> Plan {
         let mut plan = plan(self.marks.items(), &self.root_path);
         if let Some(tree) = self.tree() {
-            plan.reclaimable_bytes = Some(
-                plan.targets
-                    .iter()
-                    .filter_map(|target| {
-                        crate::marks::find(&self.root_path, tree, &target.path)
-                    })
-                    .fold(0_u64, |total, node| {
-                        total.saturating_add(
-                            node.sharing().reclaimable(node.bytes),
-                        )
-                    }),
-            );
+            plan.estimate_reclaim(|target| {
+                crate::marks::find(&self.root_path, tree, &target.path)
+                    .map(|node| node.sharing().reclaimable(node.bytes))
+            });
         }
         plan
     }
@@ -2890,6 +2882,14 @@ impl Disktree {
                     self.toggle_mark(&crumbs, cx);
                 }
             }
+            // What `o` does, for the tile under the pointer: select it, then
+            // show it in Finder, File Explorer or the file manager.
+            MouseButton::Right => {
+                if let Some(crumbs) = crumbs {
+                    self.select(Some(crumbs), cx);
+                    self.reveal_target(cx);
+                }
+            }
             // Buttons 8 and 9. gpui-pre maps them on X11, Wayland and
             // Windows; a mouse with no side buttons never sends them, and
             // then the header `<` / `>` and alt-arrows are the whole story.
@@ -2903,7 +2903,8 @@ impl Disktree {
             {
                 self.go_forward(cx);
             }
-            _ => {}
+            // Side buttons off the explore screen.
+            MouseButton::Navigate(_) => {}
         }
     }
 

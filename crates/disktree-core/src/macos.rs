@@ -1,61 +1,703 @@
-//! Darwin bulk clone hints and conditional private-size reads.
+//! What a walk on macOS needs beyond the standard library.
 //!
-//! Attribute records are packed on four-byte boundaries: decode bytes,
-//! never overlay Rust structs. The only unsafe operations are OS calls.
-#![allow(unsafe_code, reason = "Darwin attribute APIs have no safe wrapper")]
+//! `std::fs::read_dir` lists a directory with `readdir`, whose records carry
+//! a name and a type, and `DirEntry::metadata` is then an `lstat` of each
+//! entry's full path. `getattrlistbulk(2)` returns every entry's size,
+//! identity, age and flags for a whole buffer of entries, without the kernel
+//! setting up per-file state for each one as a stat must.
 
-use std::ffi::{CString, OsString};
-use std::fs::{self, File, Metadata};
+#![allow(
+    unsafe_code,
+    reason = "Darwin attribute calls, which neither std nor rustix wraps; each block \
+              says why it is sound"
+)]
+
+use std::cell::RefCell;
+use std::ffi::{CString, OsStr, c_int, c_void};
+use std::fs::Metadata;
+use std::os::unix::fs::MetadataExt as _;
+
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
 use crate::sharing::CloneInfo;
 
-// <sys/attr.h> and <sys/stat.h>; libc omits CLONE_REFCNT.
+/// Bytes the kernel fills per call: some hundreds of entries.
+const BUFFER_BYTES: usize = 64 * 1024;
+
 const REFCNT: u32 = 0x1000;
 const MAY_SHARE: u64 = 0x1 | 0x40;
 const EXTENDED: u32 = libc::FSOPT_ATTR_CMN_EXTENDED;
 const RETURNED: u32 = libc::ATTR_CMN_RETURNED_ATTRS;
 const HINTS: u32 = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
 
+// From <sys/attr.h> and <sys/vnode.h>, which the libc crate does not cover.
+const ATTR_BIT_MAP_COUNT: u16 = 5;
+const ATTR_CMN_NAME: u32 = 0x0000_0001;
+const ATTR_CMN_DEVID: u32 = 0x0000_0002;
+const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
+const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
+const ATTR_CMN_FILEID: u32 = 0x0200_0000;
+const ATTR_CMN_ERROR: u32 = 0x2000_0000;
+const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
+/// Every fork, which is what `st_blocks` counts: a resource fork is on the
+/// disk too.
+const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
+/// The data fork alone, which is what `st_size` is.
+const ATTR_FILE_DATALENGTH: u32 = 0x0000_0200;
+const VREG: u32 = 1;
+const VDIR: u32 = 2;
+const VLNK: u32 = 5;
+/// `SF_DATALESS` from <sys/stat.h>.
+const SF_DATALESS: u32 = 0x4000_0000;
+
+const COMMON_ATTRIBUTES: u32 = ATTR_CMN_RETURNED_ATTRS
+    | ATTR_CMN_NAME
+    | ATTR_CMN_DEVID
+    | ATTR_CMN_OBJTYPE
+    | ATTR_CMN_MODTIME
+    | ATTR_CMN_FLAGS
+    | ATTR_CMN_FILEID
+    | ATTR_CMN_ERROR;
+const FILE_ATTRIBUTES: u32 =
+    ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE | ATTR_FILE_DATALENGTH;
+/// What [`Cursor::entry`] reads after the name; a file system may leave
+/// any of them out.
+const MEASURED: u32 = ATTR_CMN_DEVID
+    | ATTR_CMN_OBJTYPE
+    | ATTR_CMN_MODTIME
+    | ATTR_CMN_FLAGS
+    | ATTR_CMN_FILEID;
+
+#[repr(C)]
+struct AttrList {
+    bitmapcount: u16,
+    reserved: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+unsafe extern "C" {
+    fn getattrlistbulk(
+        dirfd: c_int,
+        attr_list: *mut AttrList,
+        attr_buf: *mut c_void,
+        attr_buf_size: usize,
+        options: u64,
+    ) -> c_int;
+}
+
+thread_local! {
+    /// The last finished listing's buffer, for the next one on this thread:
+    /// a walk lists millions of directories, one at a time per thread.
+    static SPARE: RefCell<Option<Box<[u64]>>> = const { RefCell::new(None) };
+}
+
+/// What an entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Directory,
+    Link,
+    File,
+    /// A FIFO, a socket or a device node.
+    Other,
+}
+
+/// One directory entry, with what a measurement needs.
+#[derive(Debug)]
 pub struct Entry {
-    path: PathBuf,
-    name: OsString,
+    name: Box<str>,
+    /// The name as the file system spells it, only when `name` could not:
+    /// a name that is not UTF-8 is shown lossy but must still open.
+    exact: Option<Box<OsStr>>,
+    kind: Kind,
+    apparent: u64,
+    allocated: u64,
+    modified: i64,
+    device: u64,
+    inode: u64,
+    links: u32,
+    flags: u32,
     hints: Option<(u64, u64)>,
-    metadata: OnceLock<io::Result<Metadata>>,
 }
 
 impl Entry {
-    pub fn path(&self) -> PathBuf {
-        self.path.clone()
+    /// The entry's path inside `dir`, the directory it was listed from.
+    pub fn path(&self, dir: &Path) -> PathBuf {
+        dir.join(self.file_name())
     }
-    pub fn file_name(&self) -> OsString {
-        self.name.clone()
+
+    pub fn file_name(&self) -> &OsStr {
+        self.exact
+            .as_deref()
+            .unwrap_or_else(|| OsStr::new(&*self.name))
     }
-    pub fn metadata(&self) -> io::Result<Metadata> {
-        self.metadata
-            .get_or_init(|| fs::symlink_metadata(&self.path))
-            .as_ref()
-            .cloned()
-            .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+
+    /// The name as text; see [`Self::file_name`] for what it may lose.
+    pub fn name(&self) -> &str {
+        &self.name
     }
-    pub fn file_type(&self) -> io::Result<fs::FileType> {
-        self.metadata().map(|meta| meta.file_type())
+
+    /// The name, moved out: the tree keeps it, so nothing copies it. The
+    /// entry's other accessors keep working; `name`, `file_name` and
+    /// `path` do not.
+    pub fn take_name(&mut self) -> Box<str> {
+        std::mem::take(&mut self.name)
     }
-    pub fn clone_info(&self, meta: &Metadata) -> Option<Box<CloneInfo>> {
+
+    pub const fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// `st_size`.
+    pub const fn apparent(&self) -> u64 {
+        self.apparent
+    }
+
+    /// `st_blocks * 512`.
+    pub const fn allocated(&self) -> u64 {
+        self.allocated
+    }
+
+    /// Last write, in Unix seconds.
+    pub const fn modified(&self) -> i64 {
+        self.modified
+    }
+
+    /// `(st_dev, st_ino)`: the same for two names of one file.
+    pub const fn identity(&self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+
+    pub const fn device(&self) -> u64 {
+        self.device
+    }
+
+    /// Whether the file has more than one name.
+    pub const fn shared(&self) -> bool {
+        self.links > 1
+    }
+
+    /// Whether this is a directory iCloud Drive or a File Provider has
+    /// evicted, which listing would make it fetch.
+    pub const fn evicted(&self) -> bool {
+        matches!(self.kind, Kind::Directory) && self.flags & SF_DATALESS != 0
+    }
+
+    /// Only clone candidates pay for private-size reads; ordinary metadata
+    /// and identity remain the values returned by the bulk listing.
+    pub fn clone_info(&self, dir: &Path) -> Option<Box<CloneInfo>> {
         let (id, flags) = self.hints?;
-        if !meta.is_file() || flags & MAY_SHARE == 0 {
+        if self.kind != Kind::File || flags & MAY_SHARE == 0 {
             return None;
         }
-        Some(Box::new(private_info(&self.path, meta, id)))
+        Some(Box::new(private_info(
+            &self.path(dir),
+            self.device,
+            self.inode,
+            id,
+        )))
+    }
+
+    fn named(name: &[u8]) -> (Box<str>, Option<Box<OsStr>>) {
+        match std::str::from_utf8(name) {
+            Ok(text) => (text.into(), None),
+            Err(_) => (
+                String::from_utf8_lossy(name).into(),
+                Some(OsStr::from_bytes(name).into()),
+            ),
+        }
+    }
+
+    fn from_stat(name: &[u8], stat: &rustix::fs::Stat) -> Self {
+        let (name, exact) = Self::named(name);
+        let kind = match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => Kind::Directory,
+            FileType::Symlink => Kind::Link,
+            FileType::RegularFile => Kind::File,
+            _ => Kind::Other,
+        };
+        Self {
+            name,
+            exact,
+            kind,
+            apparent: stat.st_size.max(0) as u64,
+            allocated: (stat.st_blocks.max(0) as u64).saturating_mul(512),
+            modified: stat.st_mtime,
+            device: i64::from(stat.st_dev).cast_unsigned(),
+            inode: stat.st_ino,
+            links: u32::from(stat.st_nlink),
+            flags: stat.st_flags,
+            hints: None,
+        }
     }
 }
 
-const fn attrs(common: u32, file: u32, extended: u32) -> libc::attrlist {
+/// A directory being listed; like `std::fs::ReadDir`, it leaves out `.`
+/// and `..`.
+#[derive(Debug)]
+pub struct ReadDir {
+    fd: OwnedFd,
+    /// `u64`s for alignment; the records themselves are 4-byte aligned.
+    buffer: Option<Box<[u64]>>,
+    /// Records in the buffer not yet handed out.
+    remaining: u32,
+    /// Where the next of them starts.
+    offset: usize,
+    done: bool,
+    clones: bool,
+}
+
+/// List `dir`, with each entry's size, identity and age. A link at `dir`
+/// itself is followed, as `std::fs::read_dir` follows it.
+pub fn read_dir(dir: &Path, clones: bool) -> io::Result<ReadDir> {
+    let fd = rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let buffer = SPARE
+        .with_borrow_mut(Option::take)
+        .unwrap_or_else(|| vec![0; BUFFER_BYTES / 8].into_boxed_slice());
+    Ok(ReadDir {
+        fd,
+        buffer: Some(buffer),
+        remaining: 0,
+        offset: 0,
+        done: false,
+        clones,
+    })
+}
+
+impl Drop for ReadDir {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            SPARE.with_borrow_mut(|spare| *spare = Some(buffer));
+        }
+    }
+}
+
+impl Iterator for ReadDir {
+    type Item = io::Result<Entry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            if self.done {
+                return None;
+            }
+            match self.fill() {
+                Ok(0) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(count) => {
+                    self.remaining = count;
+                    self.offset = 0;
+                }
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+        self.remaining -= 1;
+        match self.record() {
+            Ok((entry, length)) => {
+                self.offset += length;
+                Some(entry)
+            }
+            Err(error) => {
+                self.remaining = 0;
+                self.done = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+impl ReadDir {
+    /// Ask the kernel for the next buffer of records; how many it wrote.
+    fn fill(&mut self) -> io::Result<u32> {
+        let buffer = self.buffer.as_mut().expect("held until drop");
+        let mut request = AttrList {
+            bitmapcount: ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: COMMON_ATTRIBUTES,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: FILE_ATTRIBUTES,
+            forkattr: if self.clones { HINTS } else { 0 },
+        };
+        loop {
+            // SAFETY: the descriptor is an open directory owned by `self`;
+            // `request` is a valid attrlist for the call's duration; and the
+            // pointer and length describe `buffer`, which is writable for
+            // that many bytes and not otherwise borrowed during the call.
+            let count = unsafe {
+                getattrlistbulk(
+                    self.fd.as_raw_fd(),
+                    &raw mut request,
+                    buffer.as_mut_ptr().cast(),
+                    BUFFER_BYTES,
+                    if self.clones { u64::from(EXTENDED) } else { 0 },
+                )
+            };
+            if let Ok(count) = u32::try_from(count) {
+                return Ok(count);
+            }
+            let error = io::Error::last_os_error();
+            // Optional clone hints must not disable ordinary enumeration on
+            // volumes or kernels that reject extended attributes.
+            if self.clones
+                && matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOTSUP)
+                )
+            {
+                self.clones = false;
+                request.forkattr = 0;
+                continue;
+            }
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// The buffer as the bytes the kernel wrote.
+    fn bytes(&self) -> &[u8] {
+        let buffer = self.buffer.as_deref().expect("held until drop");
+        // SAFETY: `[u64]` can be read as `u8`s of eight times its length:
+        // one allocation, no alignment requirement for `u8`, and every byte
+        // initialized, since the buffer starts zeroed.
+        unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_ptr().cast::<u8>(),
+                size_of_val(buffer),
+            )
+        }
+    }
+
+    /// The entry at `self.offset` and the record's length. Every length and
+    /// offset the kernel wrote is checked against the buffer before it is
+    /// used.
+    ///
+    /// Layout per getattrlist(2): a `u32` length, the returned
+    /// `attribute_set_t`, `ATTR_CMN_ERROR` when it is set, then every other
+    /// attribute in bit order, each packed at 4-byte alignment.
+    fn record(&self) -> io::Result<(io::Result<Entry>, usize)> {
+        let bytes = self.bytes();
+        let length = read_u32(bytes, self.offset)? as usize;
+        let record = bytes
+            .get(self.offset..self.offset + length)
+            .ok_or_else(malformed)?;
+        let mut cursor = Cursor { record, at: 4 };
+        let common = cursor.u32()?;
+        cursor.at += 8;
+        let file = cursor.u32()?;
+        let extended = cursor.u32()?;
+        let error = if common & ATTR_CMN_ERROR == 0 {
+            0
+        } else {
+            cursor.u32()?
+        };
+        let name = cursor.name()?;
+        if error != 0 {
+            let error = io::Error::from_raw_os_error(error.cast_signed());
+            return Ok((Err(error), length));
+        }
+        let entry = if common & MEASURED == MEASURED {
+            cursor.entry(file, extended, name)?
+        } else {
+            None
+        };
+        Ok((entry.map_or_else(|| self.stat(name), Ok), length))
+    }
+
+    /// An entry the file system described only in part, read the ordinary
+    /// way, relative to the directory already open.
+    fn stat(&self, name: &[u8]) -> io::Result<Entry> {
+        let stat =
+            rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        Ok(Entry::from_stat(name, &stat))
+    }
+}
+
+fn malformed() -> io::Error {
+    io::Error::other("the kernel returned a malformed record")
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> io::Result<u32> {
+    let field = at
+        .checked_add(4)
+        .and_then(|end| bytes.get(at..end))
+        .ok_or_else(malformed)?;
+    Ok(u32::from_ne_bytes(
+        field.try_into().map_err(|_| malformed())?,
+    ))
+}
+
+/// Reads a record's attributes in order; reading past its end is a
+/// malformed record.
+struct Cursor<'a> {
+    record: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn u32(&mut self) -> io::Result<u32> {
+        let value = read_u32(self.record, self.at)?;
+        self.at += 4;
+        Ok(value)
+    }
+
+    fn u64(&mut self) -> io::Result<u64> {
+        let field = self
+            .at
+            .checked_add(8)
+            .and_then(|end| self.record.get(self.at..end))
+            .ok_or_else(malformed)?;
+        self.at += 8;
+        Ok(u64::from_ne_bytes(
+            field.try_into().map_err(|_| malformed())?,
+        ))
+    }
+
+    /// An `attrreference_t`: an offset from itself and a length that counts
+    /// the terminating NUL.
+    fn name(&mut self) -> io::Result<&'a [u8]> {
+        let reference = self.at;
+        let offset = isize::try_from(self.u32()?.cast_signed())
+            .map_err(|_| malformed())?;
+        let length = self.u32()? as usize;
+        let name = reference
+            .checked_add_signed(offset)
+            .zip(length.checked_sub(1))
+            .and_then(|(start, length)| {
+                self.record.get(start..start.checked_add(length)?)
+            })
+            .ok_or_else(malformed)?;
+        if name.is_empty() || name == b"." || name == b".." || name.contains(&0)
+        {
+            return Err(malformed());
+        }
+        Ok(name)
+    }
+
+    /// The attributes after the name, every one of them asked for; `None`
+    /// for a file whose sizes the file system left out.
+    fn entry(
+        &mut self,
+        file: u32,
+        extended: u32,
+        name: &[u8],
+    ) -> io::Result<Option<Entry>> {
+        let device = self.u32()?.cast_signed();
+        let kind = match self.u32()? {
+            VDIR => Kind::Directory,
+            VLNK => Kind::Link,
+            VREG => Kind::File,
+            _ => Kind::Other,
+        };
+        let modified = self.u64()?.cast_signed();
+        self.at += 8;
+        let flags = self.u32()?;
+        let inode = self.u64()?;
+        // A directory is stated the ordinary way. A mount point is listed
+        // with the attributes of the directory it covers, so its DEVID is
+        // the parent volume's, and the walk would cross into every disk,
+        // share and system volume mounted below the root. `statat` reads
+        // the mounted root, as `lstat` did; directories are few beside files.
+        let (links, allocated, apparent) = if kind == Kind::Directory {
+            return Ok(None);
+        } else if file & FILE_ATTRIBUTES == FILE_ATTRIBUTES {
+            (self.u32()?, self.u64()?, self.u64()?)
+        } else {
+            return Ok(None);
+        };
+        let clone_id = if extended & libc::ATTR_CMNEXT_CLONEID != 0 {
+            Some(self.u64()?)
+        } else {
+            None
+        };
+        let clone_flags = if extended & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
+            Some(self.u64()?)
+        } else {
+            None
+        };
+        let hints = clone_id.zip(clone_flags);
+        let (name, exact) = Entry::named(name);
+        Ok(Some(Entry {
+            name,
+            exact,
+            kind,
+            apparent,
+            allocated,
+            modified,
+            device: i64::from(device).cast_unsigned(),
+            inode,
+            links,
+            flags,
+            hints,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    fn listed(dir: &Path) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = read_dir(dir, false)
+            .expect("list")
+            .collect::<io::Result<_>>()
+            .expect("entries");
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries
+    }
+
+    /// What `lstat` says of each entry, the way the standard listing reads it.
+    fn stated(dir: &Path) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = fs::read_dir(dir)
+            .expect("list")
+            .map(|entry| {
+                let entry = entry.expect("entry");
+                let stat = rustix::fs::lstat(entry.path()).expect("lstat");
+                Entry::from_stat(entry.file_name().as_bytes(), &stat)
+            })
+            .collect();
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries
+    }
+
+    type Fields = (String, Kind, u64, u64, i64, (u64, u64), bool, bool);
+
+    /// What the walk reads of a leaf.
+    fn fields(entry: &Entry) -> Fields {
+        (
+            entry.name.to_string(),
+            entry.kind,
+            entry.apparent,
+            entry.allocated,
+            entry.modified,
+            entry.identity(),
+            entry.shared(),
+            entry.evicted(),
+        )
+    }
+
+    #[test]
+    fn a_listing_has_names_kinds_lengths_and_no_dot_entries() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::create_dir(temp.path().join("sub")).expect("mkdir");
+        fs::write(temp.path().join("data.bin"), vec![7_u8; 100_000])
+            .expect("write");
+        symlink("data.bin", temp.path().join("link")).expect("symlink");
+
+        let entries = listed(temp.path());
+        let names: Vec<&OsStr> = entries.iter().map(Entry::file_name).collect();
+        assert_eq!(names, ["data.bin", "link", "sub"]);
+        assert_eq!(entries[0].kind(), Kind::File);
+        assert_eq!(entries[0].apparent(), 100_000);
+        assert_eq!(entries[0].path(temp.path()), temp.path().join("data.bin"));
+        assert_eq!(entries[1].kind(), Kind::Link);
+        assert_eq!(entries[2].kind(), Kind::Directory);
+        assert!(entries[0].modified() > 0, "written just now");
+    }
+
+    #[test]
+    fn every_leaf_reads_as_lstat_reads_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        fs::write(root.join("plain"), b"hi").expect("write");
+        fs::hard_link(root.join("plain"), root.join("hard")).expect("link");
+        // Ten megabytes long, nothing written: no blocks.
+        fs::File::create(root.join("sparse"))
+            .and_then(|file| file.set_len(10 << 20))
+            .expect("sparse");
+        symlink("plain", root.join("link")).expect("symlink");
+        // A resource fork, which `st_blocks` counts and `st_size` does not.
+        let forked = root.join("forked");
+        fs::write(&forked, b"data").expect("write");
+        rustix::fs::setxattr(
+            &forked,
+            "com.apple.ResourceFork",
+            &vec![b'r'; 20_000],
+            rustix::fs::XattrFlags::empty(),
+        )
+        .expect("resource fork");
+
+        let listed: Vec<Fields> = listed(root).iter().map(fields).collect();
+        let stated: Vec<Fields> = stated(root).iter().map(fields).collect();
+        assert_eq!(listed, stated);
+        // Adding clone hints must preserve ordinary metadata, including
+        // resource forks and hardlink identity in the same bulk record.
+        let mut clone_entries: Vec<Entry> = read_dir(root, true)
+            .expect("list with clone hints")
+            .collect::<io::Result<_>>()
+            .expect("entries");
+        clone_entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let clone_fields: Vec<Fields> =
+            clone_entries.iter().map(fields).collect();
+        assert_eq!(clone_fields, stated);
+        let forked = listed.iter().find(|leaf| leaf.0 == "forked").unwrap();
+        assert_eq!(forked.2, 4, "the data fork's length");
+        assert!(forked.3 >= 20_000, "the fork's blocks: {}", forked.3);
+        let plain = listed.iter().find(|leaf| leaf.0 == "plain").unwrap();
+        assert!(plain.6, "two names");
+    }
+
+    #[test]
+    fn a_directory_larger_than_the_buffer_is_listed_whole() {
+        let temp = TempDir::new().expect("tempdir");
+        // About a hundred bytes a record: several fills.
+        let count = 3 * BUFFER_BYTES / 100;
+        for index in 0..count {
+            fs::write(temp.path().join(format!("file-{index:05}")), b"")
+                .expect("write");
+        }
+        let entries = listed(temp.path());
+        assert_eq!(entries.len(), count);
+        assert_eq!(entries[0].name(), "file-00000");
+        assert_eq!(entries[count - 1].name(), format!("file-{:05}", count - 1));
+    }
+
+    #[test]
+    fn names_are_text_and_open() {
+        let temp = TempDir::new().expect("tempdir");
+        for name in ["café", "日本語", "with space", "a\nb"] {
+            fs::write(temp.path().join(name), b"x").expect("write");
+        }
+        let entries = listed(temp.path());
+        assert_eq!(entries.len(), 4);
+        for entry in entries {
+            assert!(entry.exact.is_none(), "{}", entry.name());
+            assert!(fs::metadata(entry.path(temp.path())).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_missing_directory_is_an_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let error =
+            read_dir(&temp.path().join("gone"), false).expect_err("missing");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+const fn clone_attrs(common: u32, file: u32, extended: u32) -> libc::attrlist {
     libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -67,117 +709,9 @@ const fn attrs(common: u32, file: u32, extended: u32) -> libc::attrlist {
     }
 }
 
-/// Unsupported volumes/kernels retain the standard walk. Restarting only
-/// after discarding the partial bulk listing prevents duplicate entries.
-pub fn read_dir(
-    path: &Path,
-    clones: bool,
-) -> io::Result<std::vec::IntoIter<io::Result<Entry>>> {
-    if clones && let Ok(entries) = bulk(path) {
-        return Ok(entries.into_iter());
-    }
-    let entries = fs::read_dir(path)?
-        .map(|entry| {
-            entry.map(|entry| Entry {
-                path: entry.path(),
-                name: entry.file_name(),
-                hints: None,
-                metadata: OnceLock::new(),
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(entries.into_iter())
-}
-
-fn bulk(path: &Path) -> io::Result<Vec<io::Result<Entry>>> {
-    let directory = File::open(path)?;
-    let mut request = attrs(libc::ATTR_CMN_NAME, 0, HINTS);
-    // u64 backing provides getattrlistbulk's required eight-byte alignment.
-    let mut buffer = vec![0_u64; 8192];
-    let mut entries = Vec::new();
-    loop {
-        // SAFETY: fd is owned, request has the Darwin ABI, buffer is writable
-        // and aligned; its advertised capacity is exactly its byte length.
-        let count = unsafe {
-            libc::getattrlistbulk(
-                directory.as_raw_fd(),
-                (&raw mut request).cast(),
-                buffer.as_mut_ptr().cast(),
-                size_of_val(buffer.as_slice()),
-                u64::from(EXTENDED),
-            )
-        };
-        if count < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if count == 0 {
-            return Ok(entries);
-        }
-        let bytes: Vec<u8> =
-            buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
-        let mut rest = bytes.as_slice();
-        for _ in 0..count {
-            let length = read_u32(rest, 0).ok_or_else(invalid)? as usize;
-            if length < 24 {
-                return Err(invalid());
-            }
-            let record = rest.get(..length).ok_or_else(invalid)?;
-            entries.push(Ok(parse_entry(path, record)?));
-            rest = rest.get(length..).ok_or_else(invalid)?;
-        }
-    }
-}
-
-fn parse_entry(path: &Path, record: &[u8]) -> io::Result<Entry> {
-    let common = read_u32(record, 4).ok_or_else(invalid)?;
-    let extended = read_u32(record, 20).ok_or_else(invalid)?;
-    if common & (RETURNED | libc::ATTR_CMN_NAME)
-        != RETURNED | libc::ATTR_CMN_NAME
-    {
-        return Err(invalid());
-    }
-    let offset = read_u32(record, 24).ok_or_else(invalid)?.cast_signed();
-    let start = 24_usize
-        .checked_add_signed(offset as isize)
-        .ok_or_else(invalid)?;
-    let length = read_u32(record, 28).ok_or_else(invalid)? as usize;
-    let end = start.checked_add(length).ok_or_else(invalid)?;
-    let name = record
-        .get(start..end)
-        .and_then(|s| s.strip_suffix(&[0]))
-        .ok_or_else(invalid)?;
-    if name.is_empty()
-        || name.contains(&b'/')
-        || name.contains(&0)
-        || name == b"."
-        || name == b".."
-    {
-        return Err(invalid());
-    }
-    let mut at = 32;
-    let id = if extended & libc::ATTR_CMNEXT_CLONEID != 0 {
-        at += 8;
-        read_u64(record, 32).ok_or_else(invalid)?
-    } else {
-        0
-    };
-    let flags = if extended & libc::ATTR_CMNEXT_EXT_FLAGS != 0 {
-        read_u64(record, at).ok_or_else(invalid)?
-    } else {
-        0
-    };
-    let name = OsString::from_vec(name.to_vec());
-    Ok(Entry {
-        path: path.join(&name),
-        name,
-        hints: Some((id, flags)),
-        metadata: OnceLock::new(),
-    })
-}
-
-fn private_info(path: &Path, meta: &Metadata, id: u64) -> CloneInfo {
+fn private_info(path: &Path, device: u64, inode: u64, id: u64) -> CloneInfo {
     let mut info = CloneInfo {
-        device: meta.dev(),
+        device,
         id,
         ..CloneInfo::default()
     };
@@ -186,7 +720,7 @@ fn private_info(path: &Path, meta: &Metadata, id: u64) -> CloneInfo {
     };
     // Re-read identity alongside private size: a replacement between the
     // listing/stat and this call must not receive the old file's estimate.
-    let mut request = attrs(
+    let mut request = clone_attrs(
         libc::ATTR_CMN_FILEID,
         libc::ATTR_FILE_DATAALLOCSIZE,
         libc::ATTR_CMNEXT_PRIVATESIZE | HINTS | REFCNT,
@@ -215,55 +749,49 @@ fn private_info(path: &Path, meta: &Metadata, id: u64) -> CloneInfo {
         }
         return info;
     }
-    let Some(length) = read_u32(&buffer, 0) else {
+    let Some(length) = clone_read_u32(&buffer, 0) else {
         return info;
     };
     let Some(buffer) = buffer.get(..length as usize) else {
         return info;
     };
-    let common = read_u32(buffer, 4).unwrap_or(0);
-    let files = read_u32(buffer, 16).unwrap_or(0);
-    let extended = read_u32(buffer, 20).unwrap_or(0);
+    let common = clone_read_u32(buffer, 4).unwrap_or(0);
+    let files = clone_read_u32(buffer, 16).unwrap_or(0);
+    let extended = clone_read_u32(buffer, 20).unwrap_or(0);
     if common & libc::ATTR_CMN_FILEID == 0
-        || read_u64(buffer, 24) != Some(meta.ino())
+        || clone_read_u64(buffer, 24) != Some(inode)
     {
         return info;
     }
     // Packed order: fileid, dataallocsize, privatesize, cloneid, flags, refcnt.
     if extended & libc::ATTR_CMNEXT_CLONEID == 0
-        || read_u64(buffer, 48) != Some(id)
+        || clone_read_u64(buffer, 48) != Some(id)
     {
         return info;
     }
     if extended & libc::ATTR_CMNEXT_PRIVATESIZE != 0 {
-        info.private_bytes = read_u64(buffer, 40);
+        info.private_bytes = clone_read_u64(buffer, 40);
     }
     if files & libc::ATTR_FILE_DATAALLOCSIZE != 0 {
-        info.data_bytes = read_u64(buffer, 32).unwrap_or(0);
+        info.data_bytes = clone_read_u64(buffer, 32).unwrap_or(0);
     }
     if extended & REFCNT != 0 {
-        info.references = read_u32(buffer, 64).unwrap_or(0);
+        info.references = clone_read_u32(buffer, 64).unwrap_or(0);
     }
     info
 }
 
-fn invalid() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "invalid Darwin attribute record",
-    )
-}
-fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+fn clone_read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
 }
-fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
+fn clone_read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_ne_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
 }
 
 /// Exceptional path for followed symlinks; ordinary entries use bulk hints.
 pub fn clone_info(path: &Path, meta: &Metadata) -> Option<Box<CloneInfo>> {
     let path_c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut request = attrs(0, 0, HINTS);
+    let mut request = clone_attrs(0, 0, HINTS);
     let mut buffer = [0_u8; 40];
     // SAFETY: valid path, ABI request and writable buffer of the stated size.
     let result = unsafe {
@@ -276,18 +804,24 @@ pub fn clone_info(path: &Path, meta: &Metadata) -> Option<Box<CloneInfo>> {
         )
     };
     if result != 0
-        || read_u32(&buffer, 20)? & HINTS != HINTS
-        || read_u64(&buffer, 32)? & MAY_SHARE == 0
+        || clone_read_u32(&buffer, 20)? & HINTS != HINTS
+        || clone_read_u64(&buffer, 32)? & MAY_SHARE == 0
     {
         return None;
     }
-    Some(Box::new(private_info(path, meta, read_u64(&buffer, 24)?)))
+    Some(Box::new(private_info(
+        path,
+        meta.dev(),
+        meta.ino(),
+        clone_read_u64(&buffer, 24)?,
+    )))
 }
 
 #[cfg(test)]
-mod tests {
+mod clone_tests {
     use super::*;
     use crate::scan::{ScanOptions, scan};
+    use std::fs;
     use std::io::{Seek, SeekFrom, Write};
     use std::process::Command;
 
@@ -373,14 +907,26 @@ mod tests {
         let temp = fixture();
         let source = temp.path().join("original");
         let meta = fs::metadata(&source).expect("metadata");
-        let info = private_info(&temp.path().join("missing"), &meta, 42);
+        let info = private_info(
+            &temp.path().join("missing"),
+            meta.dev(),
+            meta.ino(),
+            42,
+        );
         assert_eq!(info.private_bytes, None);
         assert_eq!(info.references, 0);
     }
 
     #[test]
     fn malformed_bulk_names_and_records_are_rejected() {
-        assert!(parse_entry(Path::new("/"), &[]).is_err());
+        assert!(
+            Cursor {
+                record: &[],
+                at: 24
+            }
+            .name()
+            .is_err()
+        );
         let mut record = vec![0_u8; 64];
         record[4..8]
             .copy_from_slice(&(RETURNED | libc::ATTR_CMN_NAME).to_ne_bytes());
@@ -388,12 +934,31 @@ mod tests {
         record[28..32].copy_from_slice(&3_u32.to_ne_bytes());
         record[32..35].copy_from_slice(b"ok\0");
         assert_eq!(
-            parse_entry(Path::new("/"), &record).expect("entry").path(),
-            Path::new("/ok")
+            Cursor {
+                record: &record,
+                at: 24
+            }
+            .name()
+            .expect("name"),
+            b"ok"
         );
         record[32..35].copy_from_slice(b"..\0");
-        assert!(parse_entry(Path::new("/"), &record).is_err());
+        assert!(
+            Cursor {
+                record: &record,
+                at: 24
+            }
+            .name()
+            .is_err()
+        );
         record[24..28].copy_from_slice(&u32::MAX.to_ne_bytes());
-        assert!(parse_entry(Path::new("/"), &record).is_err());
+        assert!(
+            Cursor {
+                record: &record,
+                at: 24
+            }
+            .name()
+            .is_err()
+        );
     }
 }
