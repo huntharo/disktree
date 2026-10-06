@@ -69,8 +69,9 @@ pub mod icon {
 pub mod size {
     use super::Rems;
 
-    /// A crumb's sibling menu.
-    pub const SIBLING_MENU: Rems = Rems(24.0);
+    /// A crumb's sibling menu: the you-are-here bar and its gap wider than
+    /// the names alone needed, so they keep the room they had.
+    pub const SIBLING_MENU: Rems = Rems(25.0);
     pub const SIBLING_MENU_HEIGHT: Rems = Rems(32.0);
     /// The Power Efficiency menu: narrower than a sibling menu, since its
     /// names are four known words, but wide enough for Drain My Battery

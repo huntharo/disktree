@@ -683,6 +683,7 @@ fn sibling_menu(
         panel = panel.child(
             div()
                 .id(ElementId::Name(format!("sibling-{row_index}").into()))
+                .debug_selector(move || format!("sibling-{row_index}"))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -690,11 +691,34 @@ fn sibling_menu(
                 .px(space::SM)
                 .py(space::XS)
                 .when(highlighted, |this| this.bg(theme.hover_fill()))
-                .hover(|style| style.bg(theme.hover_fill()))
+                // The pointer moves the one highlight the arrows move, so
+                // two filled rows never compete with the bar. Only
+                // entering a row moves it: a pointer resting on one does not
+                // take the highlight back from the arrow keys.
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered && let Some(menu) = this.crumb_menu.as_mut() {
+                        menu.highlighted = row_index;
+                        cx.notify();
+                    }
+                }))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.choose_sibling(&parent, row.index, cx);
                     window.focus(&this.focus, cx);
                 }))
+                // Where you are keeps a bar, like the Selection panel's,
+                // wherever the highlight goes: bold alone read as losing to
+                // the fill under the pointer. Not a check, which here reads
+                // as picked, and in the removal log means removed.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(space::XS)
+                        .h(text::BODY)
+                        .when(current, |this| {
+                            this.debug_selector(|| "sibling-here".into())
+                                .bg(theme.accent)
+                        }),
+                )
                 .child(
                     div()
                         .flex_1()
