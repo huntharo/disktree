@@ -167,8 +167,9 @@ mod tests {
     #[test]
     fn reclaimable_matches_are_topmost_and_largest_first() {
         let root = tree();
+        let root_path = Path::new("/r");
         let found = find(
-            Path::new("/r"),
+            root_path,
             &root,
             &Filter {
                 reclaimable: true,
@@ -176,12 +177,15 @@ mod tests {
             },
             10,
         );
-        let paths: Vec<String> = found
-            .matches
-            .iter()
-            .map(|(path, _)| path.display().to_string())
-            .collect();
-        assert_eq!(paths, ["/r/.cache", "/r/src/target"]);
+        let paths: Vec<PathBuf> =
+            found.matches.iter().map(|(path, _)| path.clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                root_path.join(".cache"),
+                root_path.join("src").join("target")
+            ]
+        );
         assert_eq!(found.count, 2);
         assert_eq!(found.bytes, 700);
     }
