@@ -131,6 +131,7 @@ disktree            # scan the home directory
 disktree --disk     # the whole disk it lives on
 disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
+disktree mcp        # serve an AI agent over stdio; see "With an AI agent"
 ```
 
 ### The screen
@@ -245,6 +246,48 @@ coding agent: free the space by removing what you picked, checking each path
 first (git work that exists nowhere else, a tool's own clean command) and
 touching nothing else. A name holding a newline is left out of the list and
 escaped in the prompt, so it cannot pass for another path.
+
+## With an AI agent
+
+disktree is also an [MCP](https://modelcontextprotocol.io) server, so an
+agent such as Claude Code or Codex can do the looking while you keep the
+deciding. One command connects it, and there is nothing to configure, sign
+in to or approve: the agent runs `disktree mcp` as you, over stdio, and can
+do no more than your shell can.
+
+```sh
+claude mcp add --scope user disktree -- disktree mcp
+```
+
+(Codex: `codex mcp add disktree -- disktree mcp`. Any other client: a
+server named `disktree` with the command `disktree` and the argument
+`mcp`. The window's **Work with an AI agent** line, under the disk, has
+each command with the binary's full path and a Copy button.)
+
+Then ask it what is eating your disk. The agent scans on its own, in
+seconds for a home directory, walks the tree largest first, lists every
+cache, build directory and package store at once, and marks what can go.
+Marking is all it can do: `disktree_review` opens disktree's review screen,
+and you press Enter there. There is no tool that deletes.
+
+When a disktree window is open it follows along. The agent's marks appear
+in the mosaic and in the free-space meter as it makes them, `show` moves
+the view to what it is looking at, and the header names the agent and its
+last action while it is connected. If no window is open, the agent can open
+one for the review. Without a display it works headless and says so.
+
+The tools: `disktree_status`, `disktree_scan`, `disktree_ls`,
+`disktree_find`, `disktree_show`, `disktree_mark`, `disktree_unmark` and
+`disktree_review`. Each `mark` answers with the real plan: what the guards
+below keep back and why, what another mark already covers, and the free
+space it gives back on the volume, counted the way the meter counts it.
+The prompt `free-space` (in Claude Code, `/mcp__disktree__free-space`) and
+the resource `disktree://skills/free-space` carry the procedure the agent
+should follow, from `skills/disktree-free-space/SKILL.md`.
+
+The window listens on a socket only you can reach: `$XDG_RUNTIME_DIR` or
+`$TMPDIR`, or `DISKTREE_LINK` to choose. On Windows the agent works
+headless for now; the window link needs a named pipe there.
 
 ## What it measures
 
@@ -401,6 +444,9 @@ gone while their neighbours are not.
 | path | what lives there |
 | --- | --- |
 | `crates/disktree-core` | scanning, the tree, the squarified layout, free space and removal — no UI |
+| `crates/disktree-mcp` | `disktree mcp`: the agent's tools over stdio, on `disktree-core` |
+| `crates/disktree-link` | the socket between a window and an agent, and its messages |
+| `skills/` | the free-space procedure the MCP server hands an agent |
 | `crates/disktree-app/src/state.rs` | every action the interface can take, and the key map |
 | `crates/disktree-app/src/views.rs` | the screens |
 | `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |

@@ -11,6 +11,7 @@
 // reach one. Ignored elsewhere.
 #![windows_subsystem = "windows"]
 
+mod agent;
 mod app_menu;
 mod appearance;
 mod git;
@@ -51,9 +52,12 @@ const USAGE: &str = "\
 disktree — a treemap of what is using your disk
 
 usage: disktree [OPTIONS] [PATH]
+       disktree mcp
 
 arguments:
   PATH              directory to scan (default: the home directory)
+  mcp               serve an AI agent over stdio instead of opening a
+                    window: `claude mcp add disktree -- disktree mcp`
 
 The window opens on a treemap of the root, largest first. Space marks the
 selected tile, Enter opens it, c reviews the marked list, ? lists every key.
@@ -91,6 +95,12 @@ fn main() -> Result<()> {
 }
 
 fn run() -> Result<()> {
+    // `disktree mcp` is the agent's disktree: it scans and marks over stdin
+    // and stdout and opens no window of its own, though it may open one for
+    // the review screen.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "mcp") {
+        return disktree_mcp::serve();
+    }
     let saved = power::settings_path()
         .map_or_else(
             || Ok(power::PowerEfficiency::default()),
@@ -198,6 +208,23 @@ fn run() -> Result<()> {
                 let focus = this.focus.clone();
                 window.focus(&focus, cx);
             });
+
+            // Listen for an agent. Another window already linked, or a
+            // system without the socket, leaves this one on its own; the
+            // agent then works headless and says so.
+            match disktree_link::Listener::bind() {
+                Ok(listener) => {
+                    let _ = window.update(cx, |this, _, cx| {
+                        this.attach_agent(listener, cx);
+                    });
+                }
+                Err(error)
+                    if error.kind() != std::io::ErrorKind::Unsupported =>
+                {
+                    eprintln!("agent link not available: {error}");
+                }
+                Err(_) => {}
+            }
             cx.activate(true);
         });
     Ok(())
