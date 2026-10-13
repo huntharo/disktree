@@ -115,9 +115,13 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    comes from `statvfs` before and after.
 10. **An agent marks; a person removes.** `disktree mcp` has no tool that
     deletes, and the window link has no request that does. `review` only
-    opens the review screen. When a window is linked its marks are the
-    marks: every link answer carries them, and the MCP session replaces
-    its own with what the window says.
+    opens the review screen. When a window is linked it is the agent's
+    source of truth: `ls`, `find` and `scan` are answered from its tree,
+    a mark is measured from it, and its marks are the marks — every link
+    answer carries them, and the MCP session replaces its own with what
+    the window says. The session's own scans are read only while no
+    window is open. The listing and search logic is `core::query`, shared
+    by both sides, so they answer alike.
 11. **The link is a same-user socket, nothing more.** `disktree-link`
     binds `0600` in a per-user directory and has no token, because the
     agent already runs as the user and `disktree mcp` scans on its own.

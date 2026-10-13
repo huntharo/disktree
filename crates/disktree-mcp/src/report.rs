@@ -1,15 +1,16 @@
-//! How a scan reads as text.
+//! How a tree reads as text.
 //!
 //! An agent reads these answers as tokens, so each is a short, aligned
 //! table with the number that matters first, rather than JSON that repeats
-//! every key on every row. Sizes are binary units, as in the window.
+//! every key on every row. Sizes are binary units, as in the window. The
+//! rows are [`Entry`] values, so a listing reads the same whether it came
+//! from the window or from this process's own scan.
 
 use std::fmt::Write as _;
 use std::path::Path;
 
-use disktree_core::classify::{Category, Reclaim};
 use disktree_core::size::{human_bytes, human_count, share, share_bar};
-use disktree_core::tree::Node;
+use disktree_link::{Entry, Found, Listing};
 
 /// Width of the share bar on a row.
 const BAR: usize = 8;
@@ -41,86 +42,59 @@ pub fn age(now: i64, then: i64) -> String {
     }
 }
 
-/// A category as the agent should say it.
-pub const fn category_name(category: Category) -> &'static str {
-    match category {
-        Category::Code => "code",
-        Category::AgentScratch => "agent scratch",
-        Category::Toolchain => "toolchain",
-        Category::Synced => "synced",
-        Category::Git => "git",
-        Category::Media => "media",
-        Category::Documents => "documents",
-        Category::Cache => "cache",
-        Category::Other => "other",
-    }
-}
-
-/// The reason space can be had back, as the window labels it.
-pub const fn reclaim_name(reclaim: Reclaim) -> &'static str {
-    reclaim.label()
-}
-
-/// What a node is, in one phrase after its name.
-pub fn describe(node: &Node, now: i64) -> String {
+/// What an entry is, in one phrase after its name.
+pub fn describe(entry: &Entry, now: i64) -> String {
     let mut parts = Vec::new();
-    if node.is_dir() {
-        parts.push(format!("{} files", human_count(node.files)));
+    if entry.is_dir {
+        parts.push(format!("{} files", human_count(entry.files)));
     }
-    if node.category != Category::Other {
-        parts.push(category_name(node.category).to_string());
+    if entry.category != "other" {
+        parts.push(entry.category.clone());
     }
-    if let Some(reclaim) = node.reclaim {
-        parts.push(format!("reclaimable: {}", reclaim_name(reclaim)));
+    if let Some(reclaim) = &entry.reclaim {
+        parts.push(format!("reclaimable: {reclaim}"));
     }
-    if node.read_error {
+    if entry.read_error {
         parts.push("unreadable".to_string());
     }
-    parts.push(age(now, node.modified));
+    parts.push(age(now, entry.modified));
     parts.join(" \u{00b7} ")
 }
 
 /// One row of a listing: share of `total`, size, name and description.
-pub fn row(node: &Node, name: &str, total: u64, now: i64) -> String {
+pub fn row(entry: &Entry, name: &str, total: u64, now: i64) -> String {
     let mut name = name.to_string();
-    if node.is_dir() {
+    if entry.is_dir {
         name.push('/');
     }
     format!(
         "{} {:>3.0}%  {:>9}  {name}  {}",
-        share_bar(node.bytes, total, BAR),
-        share(node.bytes, total),
-        human_bytes(node.bytes),
-        describe(node, now),
+        share_bar(entry.bytes, total, BAR),
+        share(entry.bytes, total),
+        human_bytes(entry.bytes),
+        describe(entry, now),
     )
 }
 
-/// The children of `node`, largest first, `limit` of them, with a line for
-/// the rest.
-pub fn children(node: &Node, limit: usize, now: i64) -> String {
+/// The children of a listing, largest first, with a line for the rest.
+pub fn children(listing: &Listing, now: i64) -> String {
     let mut out = String::new();
-    let total = node.bytes.max(1);
-    for child in node.children.iter().take(limit) {
+    let total = listing.entry.bytes.max(1);
+    for child in &listing.children {
         let _ = writeln!(out, "{}", row(child, &child.name, total, now));
     }
-    let rest = node.children.len().saturating_sub(limit);
-    if rest > 0 {
-        let bytes: u64 = node
-            .children
-            .iter()
-            .skip(limit)
-            .map(|child| child.bytes)
-            .sum();
+    if listing.more > 0 {
         let _ = writeln!(
             out,
-            "{} {:>3.0}%  {:>9}  \u{2026} {rest} more",
-            share_bar(bytes, total, BAR),
-            share(bytes, total),
-            human_bytes(bytes),
+            "{} {:>3.0}%  {:>9}  \u{2026} {} more",
+            share_bar(listing.more_bytes, total, BAR),
+            share(listing.more_bytes, total),
+            human_bytes(listing.more_bytes),
+            listing.more,
         );
     }
-    if node.children.is_empty() {
-        out.push_str(if node.is_dir() {
+    if listing.children.is_empty() {
+        out.push_str(if listing.entry.is_dir {
             "(empty, or not read)\n"
         } else {
             "(a file)\n"
@@ -129,10 +103,28 @@ pub fn children(node: &Node, limit: usize, now: i64) -> String {
     out
 }
 
+/// Search matches, each with its full path, sharing `total`.
+pub fn matches(
+    found: &[Found],
+    total: u64,
+    now: i64,
+    home: Option<&Path>,
+) -> String {
+    let mut out = String::new();
+    for item in found {
+        let _ = writeln!(
+            out,
+            "{}",
+            row(&item.entry, &display(&item.path, home), total, now)
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use disktree_core::tree::{Metric, NodeKind, aggregate};
+    use disktree_core::tree::{Metric, Node, NodeKind, aggregate};
     use std::path::PathBuf;
 
     #[test]
@@ -162,7 +154,9 @@ mod tests {
             root.children.push(Node::entry(name, NodeKind::File, bytes));
         }
         aggregate(&mut root, Metric::Bytes);
-        let text = children(&root, 2, 0);
+        let listing =
+            Listing::of(Path::new("/r"), root.bytes, Path::new("/r"), &root, 2);
+        let text = children(&listing, 0);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("60 B  b "), "{}", lines[0]);

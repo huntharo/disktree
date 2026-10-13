@@ -2428,23 +2428,116 @@ fn an_agent_marks_shows_and_reviews_over_the_link(cx: &mut TestAppContext) {
         "the header names the connected agent"
     );
 
-    // Marking lands in the window's marks, with the agent's measurement.
+    // Marking lands in the window's marks; the agent's own number is only
+    // a stand-in, and a wrong one is corrected from the tree.
     let marked = ask(
         cx,
         Request::Mark {
             root: root.clone(),
             targets: vec![MarkRequest {
                 path: root.join("junk"),
-                bytes: 300_000,
-                is_dir: true,
+                bytes: 7,
+                is_dir: false,
             }],
         },
     );
-    let Response::State(state) = marked else {
+    let Response::Marked { state, refused } = marked else {
         panic!("mark answers with the state: {marked:?}");
     };
+    assert!(refused.is_empty(), "{refused:?}");
     assert_eq!(state.marks.len(), 1);
-    assert_eq!(read(&view, cx, |app| app.plan().bytes()), 300_000);
+    // The window measured the mark from its own tree, not from the
+    // agent's number.
+    let measured = read(&view, cx, |app| {
+        app.crumbs_for_path(&root.join("junk"))
+            .and_then(|crumbs| app.node_at(&crumbs).map(|node| node.bytes))
+    })
+    .expect("junk is in the tree");
+    assert_eq!(state.marks[0].bytes, measured);
+    assert!(state.marks[0].is_dir);
+    assert_ne!(measured, 7);
+    assert_eq!(read(&view, cx, |app| app.plan().bytes()), measured);
+    assert!(state.tree.is_some_and(|tree| tree.files > 0));
+
+    // A path the tree does not have is refused, not guessed at.
+    let missing = ask(
+        cx,
+        Request::Mark {
+            root: root.clone(),
+            targets: vec![MarkRequest {
+                path: root.join("nowhere"),
+                bytes: 1,
+                is_dir: false,
+            }],
+        },
+    );
+    let Response::Marked { refused, .. } = missing else {
+        panic!("{missing:?}");
+    };
+    assert_eq!(refused.len(), 1);
+    assert_eq!(read(&view, cx, |app| app.marks.len()), 1);
+
+    // The agent reads the window's tree: a listing and a search.
+    let listed = ask(
+        cx,
+        Request::Ls {
+            path: root.clone(),
+            limit: 10,
+        },
+    );
+    let Response::Listing(listing) = listed else {
+        panic!("{listed:?}");
+    };
+    assert!(listing.children.iter().any(|child| child.name == "junk"));
+    assert_eq!(listing.root_bytes, listing.entry.bytes);
+    let outside = ask(
+        cx,
+        Request::Ls {
+            path: PathBuf::from("/definitely/elsewhere"),
+            limit: 10,
+        },
+    );
+    assert!(
+        matches!(outside, Response::Error { ref message } if message.contains("outside")),
+        "{outside:?}"
+    );
+    let found = ask(
+        cx,
+        Request::Find(disktree_link::FindRequest {
+            kind: "file".into(),
+            name: Some("blob".into()),
+            limit: 5,
+            ..disktree_link::FindRequest::default()
+        }),
+    );
+    let Response::Found(found) = found else {
+        panic!("{found:?}");
+    };
+    // Two blobs, the larger first.
+    assert_eq!(found.count, 2);
+    assert_eq!(found.matches[0].path, root.join(".cache/blob.bin"));
+    assert_eq!(found.matches[1].path, root.join("junk/blob.bin"));
+
+    // A scan the agent asks for runs in the window; the state says when it
+    // has landed, and the marks survive it.
+    let rescanned = ask(
+        cx,
+        Request::Scan {
+            root: root.clone(),
+            options: disktree_link::ScanOptionsRequest::default(),
+        },
+    );
+    assert!(
+        matches!(rescanned, Response::State(ref s) if s.scanning),
+        "{rescanned:?}"
+    );
+    finish_scan(&view, cx);
+    let after = ask(cx, Request::State);
+    let Response::State(after) = after else {
+        panic!("{after:?}");
+    };
+    assert!(!after.scanning && after.scanned);
+    assert_eq!(after.marks.len(), 1);
 
     // A path inside the mark is left alone, not toggled off or added.
     ask(

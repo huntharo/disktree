@@ -43,13 +43,17 @@ on the review screen. You never remove anything yourself.
 ## Procedure
 
 1. **Measure the gap.** `disktree_status` shows the volumes, their free
-   space, and whether a disktree window is open. Note what the user wants:
-   a number, or "whatever is safe".
+   space, and whether a disktree window is open. When one is, its tree is
+   what every tool reads: you and the user look at the same numbers, and
+   a path outside its root needs a `disktree_scan` from higher up, which
+   the window follows. Note what the user wants: a number, or "whatever
+   is safe".
 2. **Scan.** `disktree_scan` with no path scans the home directory in a
-   few seconds; `disk: true` scans the whole volume. The result lists the
-   top level, largest first, and *worth a look*: the biggest directories
-   that could plausibly go (caches, build output, package stores, stale
-   agent worktrees and experiments).
+   few seconds; `disk: true` scans the whole volume. With a window open it
+   does the scanning and shows the result. The result lists the top
+   level, largest first, and *worth a look*: the biggest directories that
+   could plausibly go (caches, build output, package stores, stale agent
+   worktrees and experiments).
 3. **Walk, biggest first.** `disktree_ls` on the largest directories, a few
    levels down, until a directory clearly belongs to one project or one
    tool. Pass `show: true` so the window follows you; the user then sees
