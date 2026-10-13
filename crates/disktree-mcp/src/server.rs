@@ -6,6 +6,7 @@
 //! destructive, and the review screen belongs to the person.
 
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -22,9 +23,15 @@ use rmcp::{
 };
 
 use crate::session::{
-    FindParams, LsParams, PathsParams, ScanParams, Session, ShowParams,
-    run_scan,
+    FindParams, LsParams, PathsParams, ScanParams, ScanPlan, Session,
+    ShowParams, run_scan,
 };
+
+/// How often a scan the window is running is looked in on.
+const SCAN_POLL: Duration = Duration::from_millis(500);
+/// How long a window scan is followed before the agent is told to come
+/// back: a whole disk can take minutes, a tool call should not.
+const SCAN_WAIT: Duration = Duration::from_mins(10);
 
 /// The free-space procedure's address as a resource.
 pub const SKILL_URI: &str = "disktree://skills/free-space";
@@ -42,8 +49,10 @@ returns the plan: what the guards keep back and why, and the free space \
 it would give back on the volume. You never delete: disktree_review \
 opens disktree's review screen, where the user presses Enter to move \
 the marks to the trash. disktree_status afterwards says what was freed. \
-When a disktree window is open it follows along; pass show: true to \
-disktree_ls or call disktree_show so the user sees what you see. The \
+When a disktree window is open its tree is what you read: ls, find and \
+scan are answered from what the user sees, and a path outside its root \
+needs a disktree_scan from higher up, which the window follows. Pass \
+show: true to disktree_ls or call disktree_show to move the view. The \
 prompt free-space and the resource disktree://skills/free-space hold \
 the full procedure.";
 
@@ -98,7 +107,9 @@ impl Server {
     /// true scans the whole volume. Returns totals, the volume's free space
     /// and how much of its used space this scan explains, the top level
     /// largest first, and the biggest things that could plausibly go.
-    /// Scanning the same root again replaces the earlier scan.
+    /// Scanning the same root again replaces the earlier scan. When a
+    /// disktree window is open it does the scanning and shows the result;
+    /// the window's tree is then what every other tool reads.
     #[tool(
         name = "disktree_scan",
         annotations(title = "Scan a directory", read_only_hint = true)
@@ -107,11 +118,36 @@ impl Server {
         &self,
         Parameters(params): Parameters<ScanParams>,
     ) -> Result<String, String> {
-        let (root, options) = self.with(|s| s.prepare_scan(&params))?;
-        let scan = tokio::task::spawn_blocking(move || run_scan(root, options))
-            .await
-            .map_err(|error| format!("the scan task failed: {error}"))??;
-        Ok(self.with(|s| s.store_scan(scan)))
+        match self.with(|s| s.prepare_scan(&params))? {
+            ScanPlan::Local { root, options } => {
+                let scan = tokio::task::spawn_blocking(move || {
+                    run_scan(root, options)
+                })
+                .await
+                .map_err(|error| format!("the scan task failed: {error}"))??;
+                Ok(self.with(|s| s.store_scan(scan)))
+            }
+            ScanPlan::Window { root } => {
+                // The window walks; the session is unlocked between looks
+                // so disktree_status still answers meanwhile.
+                let started = Instant::now();
+                loop {
+                    if let Some(report) = self.with(|s| s.window_scan(&root))? {
+                        return Ok(report);
+                    }
+                    if started.elapsed() > SCAN_WAIT {
+                        return Err(format!(
+                            "The window is still scanning {} after {} s. \
+                             disktree_status says when it is done; then \
+                             disktree_ls reads the tree.",
+                            root.display(),
+                            started.elapsed().as_secs()
+                        ));
+                    }
+                    tokio::time::sleep(SCAN_POLL).await;
+                }
+            }
+        }
     }
 
     /// List a scanned directory, largest first: each entry's share, size,

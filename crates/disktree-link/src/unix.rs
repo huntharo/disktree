@@ -329,6 +329,8 @@ mod tests {
             }],
             space: None,
             removal: None,
+            tree: None,
+            insights: Vec::new(),
         };
         match pump(&listener) {
             Incoming::Request { request, reply, .. } => {

@@ -264,17 +264,21 @@ server named `disktree` with the command `disktree` and the argument
 `mcp`. The window's **Work with an AI agent** line, under the disk, has
 each command with the binary's full path and a Copy button.)
 
-Then ask it what is eating your disk. The agent scans on its own, in
-seconds for a home directory, walks the tree largest first, lists every
-cache, build directory and package store at once, and marks what can go.
-Marking is all it can do: `disktree_review` opens disktree's review screen,
-and you press Enter there. There is no tool that deletes.
+Then ask it what is eating your disk. The agent walks the tree largest
+first, lists every cache, build directory and package store at once, and
+marks what can go. Marking is all it can do: `disktree_review` opens
+disktree's review screen, and you press Enter there. There is no tool that
+deletes.
 
-When a disktree window is open it follows along. The agent's marks appear
-in the mosaic and in the free-space meter as it makes them, `show` moves
-the view to what it is looking at, and the header names the agent and its
-last action while it is connected. If no window is open, the agent can open
-one for the review. Without a display it works headless and says so.
+When a disktree window is open, its tree is what the agent reads. `ls`,
+`find` and `scan` are answered from the mosaic on screen, a mark is
+measured from it, and the two of you see the same numbers. The agent's
+marks appear in the mosaic and in the free-space meter as it makes them,
+`show` moves the view to what it is looking at, a scan it asks for runs in
+the window, and the header names the agent and its last action while it is
+connected. With no window open the agent scans on its own, in seconds for a
+home directory, and can open a window for the review. Without a display it
+works headless and says so.
 
 The tools: `disktree_status`, `disktree_scan`, `disktree_ls`,
 `disktree_find`, `disktree_show`, `disktree_mark`, `disktree_unmark` and

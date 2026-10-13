@@ -1487,6 +1487,7 @@ dependencies = [
 name = "disktree-link"
 version = "0.11.0"
 dependencies = [
+ "disktree-core",
  "serde",
  "serde_json",
  "tempfile",

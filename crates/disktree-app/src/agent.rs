@@ -5,6 +5,10 @@
 //! asks, the UI thread answers between frames, and every answer carries the
 //! window's state, so the agent's view of the marks is always the window's.
 //!
+//! While a window is open it is the agent's source of truth: `ls`, `find`
+//! and `scan` are answered from the tree on screen, and a mark is measured
+//! from it too, so the agent and the person read the same numbers.
+//!
 //! An agent can look, mark and open the review screen. It cannot remove
 //! anything: the review screen is where the person decides, same as when
 //! they marked everything themselves.
@@ -12,11 +16,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use disktree_core::query;
 use disktree_core::removal::{RemovalMode, Target};
 use disktree_core::space::space_info;
-use disktree_core::tree::Node;
+use disktree_core::tree::{Node, path_of};
 use disktree_link::{
-    Incoming, Listener, Mark, Removal, Request, Response, Space, State, VERSION,
+    FindRequest, FoundList, Incoming, Insight, Listener, Listing, Mark,
+    MarkRequest, Refused, Removal, Request, Response, ScanOptionsRequest,
+    Space, State, TreeSummary, VERSION,
 };
 use gpui_kit::Context;
 use gpui_omarchy::Status;
@@ -186,34 +193,13 @@ impl Disktree {
             }
             Request::State => Response::State(self.agent_state()),
             Request::Show { root, path } => self.agent_show(root, path, cx),
+            Request::Scan { root, options } => {
+                self.agent_scan(root, options, cx)
+            }
+            Request::Ls { path, limit } => self.agent_ls(path, *limit),
+            Request::Find(request) => self.agent_find(request),
             Request::Mark { root, targets } => {
-                if self.screen == Screen::Running {
-                    return Response::error("a removal is running");
-                }
-                if *root != self.root_path {
-                    self.set_root(root.clone(), cx);
-                }
-                let mut marked = 0_usize;
-                for target in targets {
-                    if self.agent_mark(Target {
-                        hidden: is_hidden(&target.path),
-                        path: target.path.clone(),
-                        bytes: target.bytes,
-                        is_dir: target.is_dir,
-                    }) {
-                        marked += 1;
-                    }
-                }
-                self.leave_review_if_empty();
-                self.note_agent(
-                    None,
-                    format!(
-                        "marked {marked} path{}",
-                        if marked == 1 { "" } else { "s" }
-                    ),
-                );
-                cx.notify();
-                Response::State(self.agent_state())
+                self.agent_marks(root, targets, cx)
             }
             Request::Unmark { paths } => {
                 if self.screen == Screen::Running {
@@ -243,6 +229,171 @@ impl Disktree {
                 cx.notify();
                 Response::Ok
             }
+        }
+    }
+
+    /// Scan `root` with the options the agent gave, or rescan it. Answered
+    /// at once; the agent polls the state until `scanning` turns false.
+    fn agent_scan(
+        &mut self,
+        root: &Path,
+        options: &ScanOptionsRequest,
+        cx: &mut Context<'_, Self>,
+    ) -> Response {
+        if self.screen == Screen::Running {
+            return Response::error("a removal is running");
+        }
+        if let Some(apparent) = options.apparent_size {
+            self.options.apparent_size = apparent;
+        }
+        if let Some(hidden) = options.include_hidden {
+            self.options.include_hidden = hidden;
+        }
+        if let Some(one) = options.one_filesystem {
+            self.options.one_filesystem = one;
+        }
+        if let Some(depth) = options.max_depth {
+            self.options.max_depth = depth;
+        }
+        self.note_agent(
+            None,
+            format!("scanning {}", display_path(root, self.home.as_deref())),
+        );
+        if root == self.root_path {
+            self.screen = Screen::Explore;
+            self.start_scan(cx);
+        } else {
+            self.set_root(root.to_path_buf(), cx);
+        }
+        cx.notify();
+        Response::State(self.agent_state())
+    }
+
+    /// The node at `path` in the tree on screen, or why there is none.
+    fn agent_node(&self, path: &Path) -> Result<&Node, String> {
+        let tree = self.tree.as_deref().ok_or_else(|| {
+            if self.scan.is_some() {
+                "the window is still scanning; ask again when the state \
+                 says scanning is false"
+            } else {
+                "the window has no tree"
+            }
+            .to_string()
+        })?;
+        let relative = path.strip_prefix(&self.root_path).map_err(|_| {
+            format!(
+                "{} is outside the window's tree, rooted at {}",
+                display_path(path, self.home.as_deref()),
+                display_path(&self.root_path, self.home.as_deref())
+            )
+        })?;
+        tree.descend(relative).map(|(_, node)| node).ok_or_else(|| {
+            format!(
+                "{} is not in the window's tree: it may be new, hidden, \
+                 below the depth limit, or on another filesystem",
+                display_path(path, self.home.as_deref())
+            )
+        })
+    }
+
+    /// What is in a directory of the tree on screen.
+    fn agent_ls(&mut self, path: &Path, limit: usize) -> Response {
+        let listing = match self.agent_node(path) {
+            Ok(node) => Listing::of(
+                &self.root_path,
+                self.tree.as_ref().map_or(0, |tree| tree.bytes),
+                path,
+                node,
+                limit,
+            ),
+            Err(message) => return Response::error(message),
+        };
+        self.note_agent(
+            None,
+            format!("reading {}", display_path(path, self.home.as_deref())),
+        );
+        Response::Listing(listing)
+    }
+
+    /// The largest entries of the tree on screen matching a description.
+    fn agent_find(&mut self, request: &FindRequest) -> Response {
+        let filter = match request.filter() {
+            Ok(filter) => filter,
+            Err(message) => return Response::error(message),
+        };
+        let from = request
+            .path
+            .clone()
+            .unwrap_or_else(|| self.root_path.clone());
+        let found = match self.agent_node(&from) {
+            Ok(node) => {
+                FoundList::of(&query::find(&from, node, &filter, request.limit))
+            }
+            Err(message) => return Response::error(message),
+        };
+        self.note_agent(None, "searching the tree".to_string());
+        Response::Found(found)
+    }
+
+    /// Mark what the agent asks, measured from the tree on screen. A path
+    /// the tree does not have is refused, not guessed at.
+    fn agent_marks(
+        &mut self,
+        root: &Path,
+        targets: &[MarkRequest],
+        cx: &mut Context<'_, Self>,
+    ) -> Response {
+        if self.screen == Screen::Running {
+            return Response::error("a removal is running");
+        }
+        if root != self.root_path {
+            self.set_root(root.to_path_buf(), cx);
+        }
+        let mut marked = 0_usize;
+        let mut refused = Vec::new();
+        for target in targets {
+            // Without a tree yet, the agent's own measurement stands in;
+            // `Marks::refresh` corrects it when the scan lands.
+            let measured = if self.tree.is_some() {
+                match self.agent_node(&target.path) {
+                    Ok(node) => (node.bytes, node.is_dir()),
+                    Err(reason) => {
+                        refused.push(Refused {
+                            path: target.path.clone(),
+                            reason,
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                (target.bytes, target.is_dir)
+            };
+            if self.agent_mark(Target {
+                hidden: is_hidden(&target.path),
+                path: target.path.clone(),
+                bytes: measured.0,
+                is_dir: measured.1,
+            }) {
+                marked += 1;
+            } else {
+                refused.push(Refused {
+                    path: target.path.clone(),
+                    reason: "the scanned root itself, or outside it".into(),
+                });
+            }
+        }
+        self.leave_review_if_empty();
+        self.note_agent(
+            None,
+            format!(
+                "marked {marked} path{}",
+                if marked == 1 { "" } else { "s" }
+            ),
+        );
+        cx.notify();
+        Response::Marked {
+            state: self.agent_state(),
+            refused,
         }
     }
 
@@ -401,6 +552,36 @@ impl Disktree {
                 .agent
                 .as_ref()
                 .and_then(|agent| agent.last_removal.clone()),
+            tree: self.tree.as_deref().map(|tree| TreeSummary {
+                bytes: tree.bytes,
+                files: tree.files,
+                dirs: u64::from(tree.dirs),
+                scanned_at: self.scanned_at,
+                elapsed_ms: self.scan_elapsed.map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                }),
+                unreadable: self.progress.errors,
+                apparent_size: self.options.apparent_size,
+                include_hidden: self.options.include_hidden,
+            }),
+            insights: self
+                .tree
+                .as_deref()
+                .map(|tree| {
+                    self.insights
+                        .iter()
+                        .map(|candidate| Insight {
+                            path: path_of(
+                                &self.root_path,
+                                tree,
+                                &candidate.crumbs,
+                            ),
+                            bytes: candidate.bytes,
+                            what: candidate.finding.describe(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 

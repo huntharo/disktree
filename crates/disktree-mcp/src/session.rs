@@ -1,8 +1,11 @@
-//! What one connected agent knows: its scans, its marks, and the window it
-//! may be driving.
+//! What one connected agent knows: the window it is driving, or failing
+//! that its own scans, and the marks.
 //!
-//! Everything here is plain Rust over `disktree-core`, with no protocol in
-//! it, so the tools can be tested as functions. [`crate::server`] is the
+//! When a disktree window is open it is the source of truth: `ls`, `find`
+//! and `scan` read the tree the person is looking at, and the marks live
+//! there. Without a window this process scans for itself, so an agent in a
+//! terminal needs nothing else. Either way the words an agent reads come
+//! from here, over `disktree-core` and the link; [`crate::server`] is the
 //! thin layer that turns them into MCP tools.
 
 use std::fmt::Write as _;
@@ -13,22 +16,28 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use disktree_core::classify::Category;
-use disktree_core::insights::{Candidate, Finding, worth_a_look};
+use disktree_core::insights::{Candidate, worth_a_look};
+use disktree_core::query::{self, Kind};
 use disktree_core::removal::{Target, normalize, plan};
 use disktree_core::scan::{ScanHandle, ScanOptions};
 use disktree_core::size::{human_bytes, human_count, share};
 use disktree_core::space::{
     SpaceInfo, device_for, space_info, volume_root_for, volumes,
 };
-use disktree_core::tree::{Node, NodeKind, path_of};
-use disktree_link::{Link, MarkRequest, Request, Response, State, VERSION};
+use disktree_core::tree::{Node, path_of};
+use disktree_link::{
+    FindRequest, FoundList, Insight, Link, Listing, MarkRequest, Request,
+    Response, ScanOptionsRequest, Space, State, TreeSummary, VERSION,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::report::{age, children, display, reclaim_name, row};
+use crate::report::{age, children, describe, display, matches};
 
 /// How many findings a scan report lists.
 const INSIGHTS: usize = 8;
+/// Top-level rows a scan report shows.
+const TOP: usize = 12;
 /// Rows a listing shows unless asked otherwise.
 const DEFAULT_LIMIT: usize = 20;
 /// The most rows any listing shows: past this the agent should filter.
@@ -51,7 +60,8 @@ pub fn now() -> i64 {
 /// open. Swapped out in tests.
 pub type Launcher = Box<dyn Fn(&Path) -> io::Result<()> + Send>;
 
-/// One finished scan, kept for the rest of the session.
+/// One finished scan of this process's own, kept for the rest of the
+/// session.
 #[derive(Debug)]
 pub struct Scan {
     pub root: PathBuf,
@@ -64,6 +74,16 @@ pub struct Scan {
     pub space: Option<SpaceInfo>,
     pub device: Option<String>,
     pub insights: Vec<Candidate>,
+}
+
+/// What a scan request amounts to, decided with the session locked.
+#[derive(Debug)]
+pub enum ScanPlan {
+    /// Walk here, off the protocol thread, then [`Session::store_scan`].
+    Local { root: PathBuf, options: ScanOptions },
+    /// The window is scanning `root`; poll [`Session::window_scan`] until
+    /// it reports.
+    Window { root: PathBuf },
 }
 
 /// What `disktree_scan` takes.
@@ -96,7 +116,7 @@ pub struct ScanParams {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LsParams {
-    /// The directory to list, under a scanned root.
+    /// The directory to list, under the scanned root.
     pub path: PathBuf,
     /// How many entries to list, largest first. Default 20, at most 200.
     pub limit: Option<usize>,
@@ -105,12 +125,12 @@ pub struct LsParams {
     pub show: bool,
 }
 
-/// What kind of entry `disktree_find` matches.
+/// What kind of entry `disktree_find` matches; [`Kind`] as a parameter.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq,
 )]
 #[serde(rename_all = "lowercase")]
-pub enum Kind {
+pub enum KindName {
     /// Files and directories; a matching directory hides its contents.
     #[default]
     Any,
@@ -118,7 +138,18 @@ pub enum Kind {
     Dir,
 }
 
-/// A kind of data, as `disktree_find` filters it.
+impl From<KindName> for Kind {
+    fn from(name: KindName) -> Self {
+        match name {
+            KindName::Any => Self::Any,
+            KindName::File => Self::File,
+            KindName::Dir => Self::Dir,
+        }
+    }
+}
+
+/// A kind of data, as `disktree_find` filters it; [`Category`] as a
+/// parameter.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CategoryName {
@@ -153,11 +184,11 @@ impl From<CategoryName> for Category {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FindParams {
-    /// Where to search. Default: every scanned root.
+    /// Where to search. Default: the whole scanned tree.
     pub path: Option<PathBuf>,
     /// `file`, `dir` or `any` (default). A matching directory is listed
     /// once, without what is inside it.
-    pub kind: Option<Kind>,
+    pub kind: Option<KindName>,
     /// Only entries of at least this many bytes.
     pub min_bytes: Option<u64>,
     /// Only this kind of data.
@@ -175,11 +206,32 @@ pub struct FindParams {
     pub limit: Option<usize>,
 }
 
+impl FindParams {
+    /// The same search as the link words it, with `now` fixing what
+    /// `older_than_days` means.
+    fn request(&self, path: Option<PathBuf>, now: i64) -> FindRequest {
+        FindRequest {
+            path,
+            kind: Kind::from(self.kind.unwrap_or_default()).name().to_string(),
+            min_bytes: self.min_bytes.unwrap_or(0),
+            category: self
+                .category
+                .map(|name| Category::from(name).name().to_string()),
+            reclaimable: self.reclaimable,
+            name: self.name.clone(),
+            before: self
+                .older_than_days
+                .map(|days| now - i64::from(days) * 86_400),
+            limit: self.limit.unwrap_or(25).clamp(1, MAX_LIMIT),
+        }
+    }
+}
+
 /// What `disktree_mark` and `disktree_unmark` take.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PathsParams {
-    /// Absolute paths under a scanned root. For `disktree_unmark`, an
+    /// Absolute paths under the scanned root. For `disktree_unmark`, an
     /// empty list unmarks everything.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
@@ -189,7 +241,7 @@ pub struct PathsParams {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ShowParams {
-    /// The path to show in the window, under a scanned root.
+    /// The path to show in the window, under the scanned root.
     pub path: PathBuf,
 }
 
@@ -199,6 +251,7 @@ pub struct Session {
     socket: PathBuf,
     launcher: Option<Launcher>,
     client: String,
+    /// This process's own scans, read only while no window is linked.
     scans: Vec<Scan>,
     /// Marks as this session knows them: the window's when one is linked,
     /// else its own.
@@ -310,13 +363,14 @@ impl Session {
 
     // ── scanning ────────────────────────────────────────────────────────
 
-    /// Decide what a scan request means, before the walk: the root and the
-    /// options. Separate from [`run_scan`] so the walk can run with the
-    /// session unlocked.
+    /// Decide what a scan request means: the root and the options, and
+    /// whether the window or this process does the walking. With a window
+    /// linked the scan is asked of it here, and [`Self::window_scan`]
+    /// follows it; otherwise the walk runs with the session unlocked.
     pub fn prepare_scan(
-        &self,
+        &mut self,
         params: &ScanParams,
-    ) -> Result<(PathBuf, ScanOptions), String> {
+    ) -> Result<ScanPlan, String> {
         let base = match &params.path {
             Some(path) => self.absolute(path)?,
             None => self
@@ -342,79 +396,142 @@ impl Session {
             max_depth: params.max_depth,
             ..ScanOptions::default()
         };
-        Ok((root, options))
+        if !self.try_connect() {
+            return Ok(ScanPlan::Local { root, options });
+        }
+        let request = Request::Scan {
+            root: root.clone(),
+            options: ScanOptionsRequest {
+                apparent_size: Some(options.apparent_size),
+                include_hidden: Some(options.include_hidden),
+                one_filesystem: Some(options.one_filesystem),
+                max_depth: Some(options.max_depth),
+            },
+        };
+        match self.call(&request)? {
+            Response::Error { message } => Err(message),
+            _ => Ok(ScanPlan::Window { root }),
+        }
     }
 
-    /// Keep a finished scan, replacing an earlier one of the same root, and
-    /// say what it found.
+    /// Whether the window has finished the scan of `root` it was asked
+    /// for, and if so what it found. `Ok(None)` is "still scanning".
+    pub fn window_scan(
+        &mut self,
+        root: &Path,
+    ) -> Result<Option<String>, String> {
+        let state = match self.call(&Request::State)? {
+            Response::State(state) => state,
+            other => return Err(unexpected(&other)),
+        };
+        if state.root != root {
+            return Err(format!(
+                "The window moved to {} before the scan of {} finished; \
+                 the user may have gone elsewhere. Scan again if needed.",
+                self.show(&state.root),
+                self.show(root)
+            ));
+        }
+        if state.scanning {
+            return Ok(None);
+        }
+        let Some(tree) = state.tree.clone() else {
+            return Err(format!(
+                "The window has no tree for {}: its scan did not finish. \
+                 The window shows why.",
+                self.show(root)
+            ));
+        };
+        let top = match self.call(&Request::Ls {
+            path: root.to_path_buf(),
+            limit: TOP,
+        })? {
+            Response::Listing(listing) => listing,
+            Response::Error { message } => return Err(message),
+            other => return Err(unexpected(&other)),
+        };
+        let facts = ScanFacts {
+            root: root.to_path_buf(),
+            tree,
+            space: state.space,
+            device: device_for(root),
+            top,
+            insights: state.insights,
+        };
+        let mut report = self.scan_report(&facts);
+        report.push('\n');
+        report.push_str(&self.window_line());
+        Ok(Some(report))
+    }
+
+    /// Keep a finished scan of this process's own, replacing an earlier one
+    /// of the same root, and say what it found.
     pub fn store_scan(&mut self, scan: Scan) -> String {
         self.scans.retain(|known| known.root != scan.root);
-        let report = self.scan_report(&scan);
+        let report = self.scan_report(&ScanFacts::of_local(&scan));
         self.scans.push(scan);
         report
     }
 
-    fn scan_report(&self, scan: &Scan) -> String {
+    fn scan_report(&self, facts: &ScanFacts) -> String {
         let now = now();
-        let tree = &scan.tree;
+        let tree = &facts.tree;
         let mut out = String::new();
         let _ = write!(
             out,
             "Scanned {} in {:.1} s: {} \u{00b7} {} files \u{00b7} {} \
              directories",
-            self.show(&scan.root),
-            scan.elapsed.as_secs_f64(),
+            self.show(&facts.root),
+            Duration::from_millis(tree.elapsed_ms).as_secs_f64(),
             human_bytes(tree.bytes),
             human_count(tree.files),
-            human_count(u64::from(tree.dirs)),
+            human_count(tree.dirs),
         );
-        if scan.unreadable > 0 {
-            let _ = write!(out, " \u{00b7} {} unreadable", scan.unreadable);
+        if tree.unreadable > 0 {
+            let _ = write!(out, " \u{00b7} {} unreadable", tree.unreadable);
         }
-        if scan.options.apparent_size {
+        if tree.apparent_size {
             out.push_str(" \u{00b7} apparent sizes");
         }
-        if !scan.options.include_hidden {
+        if !tree.include_hidden {
             out.push_str(" \u{00b7} hidden entries skipped");
         }
-        if let Some(depth) = scan.options.max_depth {
-            let _ = write!(out, " \u{00b7} depth limited to {depth}");
-        }
         out.push('\n');
-        if let Some(space) = scan.space {
+        if let Some(space) = facts.space {
+            let used = space.total.saturating_sub(space.free);
             let _ = writeln!(
                 out,
                 "Volume {}{}: {} free of {}, {:.0}% used. This scan holds \
                  {:.0}% of what is used; the rest is outside {} or is not \
                  files (snapshots, other volumes, swap).",
-                volume_root_for(&scan.root).map_or_else(
+                volume_root_for(&facts.root).map_or_else(
                     || "?".to_string(),
                     |root| root.display().to_string()
                 ),
-                scan.device
+                facts
+                    .device
                     .as_deref()
                     .map_or_else(String::new, |device| format!(" ({device})")),
                 human_bytes(space.available),
                 human_bytes(space.total),
-                f64::from(space.used_fraction()) * 100.0,
-                share(tree.bytes, space.used().max(1)),
-                self.show(&scan.root),
+                share(used, space.total.max(1)),
+                share(tree.bytes, used.max(1)),
+                self.show(&facts.root),
             );
         }
         out.push_str("Top level, largest first:\n");
-        out.push_str(&children(tree, 12, now));
-        if !scan.insights.is_empty() {
+        out.push_str(&children(&facts.top, now));
+        if !facts.insights.is_empty() {
             out.push_str(
                 "Worth a look, the biggest things that could plausibly go:\n",
             );
-            for candidate in &scan.insights {
-                let path = path_of(&scan.root, tree, &candidate.crumbs);
+            for insight in &facts.insights {
                 let _ = writeln!(
                     out,
                     "  {:>9}  {}  {}",
-                    human_bytes(candidate.bytes),
-                    self.show(&path),
-                    finding_text(&candidate.finding),
+                    human_bytes(insight.bytes),
+                    self.show(&insight.path),
+                    insight.what,
                 );
             }
         }
@@ -444,7 +561,7 @@ impl Session {
         Ok(normalize(&expanded))
     }
 
-    /// The scan holding `path`, with the node there.
+    /// The scan of this process's own holding `path`, with the node there.
     fn locate(&self, path: &Path) -> Result<Located<'_>, String> {
         let path = self.absolute(path)?;
         if self.scans.is_empty() {
@@ -492,57 +609,96 @@ impl Session {
         })
     }
 
+    /// The window's root when it covers `path`; otherwise why the agent
+    /// should scan from higher up. Only meaningful while linked.
+    fn window_root_for(&self, path: &Path) -> Result<PathBuf, String> {
+        let Some(state) = &self.window else {
+            return Err("the window has not said where it is".to_string());
+        };
+        if path.starts_with(&state.root) {
+            return Ok(state.root.clone());
+        }
+        Err(format!(
+            "{} is outside the disktree window's tree, which is rooted at \
+             {}. The window is what the user sees, so it is what you read: \
+             call disktree_scan on a directory containing it and the window \
+             follows.",
+            self.show(path),
+            self.show(&state.root)
+        ))
+    }
+
+    /// A directory and its largest children, from the window or from a
+    /// scan of this process's own.
+    fn listing(
+        &mut self,
+        path: &Path,
+        limit: usize,
+    ) -> Result<Listing, String> {
+        if self.try_connect() {
+            self.window_root_for(path)?;
+            return match self.call(&Request::Ls {
+                path: path.to_path_buf(),
+                limit,
+            })? {
+                Response::Listing(listing) => Ok(listing),
+                Response::Error { message } => Err(message),
+                other => Err(unexpected(&other)),
+            };
+        }
+        let found = self.locate(path)?;
+        Ok(Listing::of(
+            &found.scan.root,
+            found.scan.tree.bytes,
+            &found.path,
+            found.node,
+            limit,
+        ))
+    }
+
     /// List a directory, largest first.
     pub fn ls(&mut self, params: &LsParams) -> Result<String, String> {
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let now = now();
-        let (mut out, root) = {
-            let found = self.locate(&params.path)?;
-            let mut out = String::new();
+        let path = self.absolute(&params.path)?;
+        let listing = self.listing(&path, limit)?;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "{}  {}",
+            self.show(&listing.path),
+            describe(&listing.entry, now)
+        );
+        if listing.path != listing.root {
             let _ = writeln!(
                 out,
-                "{}  {}",
-                self.show(&found.path),
-                crate::report::describe(found.node, now)
+                "{:.0}% of {}, which is {}",
+                share(listing.entry.bytes, listing.root_bytes),
+                self.show(&listing.root),
+                human_bytes(listing.root_bytes)
             );
-            if !found.crumbs.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "{:.0}% of {}, which is {}",
-                    share(found.node.bytes, found.scan.tree.bytes),
-                    self.show(&found.scan.root),
-                    human_bytes(found.scan.tree.bytes)
-                );
-            }
-            out.push_str(&children(found.node, limit, now));
-            (out, found.scan.root.clone())
-        };
+        }
+        out.push_str(&children(&listing, now));
         if params.show {
-            out.push_str(&self.show_in_window(&root, &params.path)?);
+            out.push_str(&self.show_in_window(&listing.root, &path)?);
         }
         Ok(out)
     }
 
-    /// The largest entries matching the filters, topmost matches only.
-    pub fn find(&self, params: &FindParams) -> Result<String, String> {
-        let limit = params.limit.unwrap_or(25).clamp(1, MAX_LIMIT);
-        let now = now();
-        let filter = Filter {
-            kind: params.kind.unwrap_or_default(),
-            min_bytes: params.min_bytes.unwrap_or(0),
-            category: params.category.map(Category::from),
-            reclaimable: params.reclaimable,
-            name: params
-                .name
-                .as_deref()
-                .map(str::to_lowercase)
-                .filter(|name| !name.is_empty()),
-            before: params
-                .older_than_days
-                .map(|days| now - i64::from(days) * 86_400),
-        };
-        let mut found: Vec<(PathBuf, &Node)> = Vec::new();
-        let scope = if let Some(path) = &params.path {
+    /// What a search finds, from the window or from the scans here.
+    fn found(&mut self, request: &FindRequest) -> Result<FoundList, String> {
+        if self.try_connect() {
+            if let Some(path) = &request.path {
+                self.window_root_for(path)?;
+            }
+            return match self.call(&Request::Find(request.clone()))? {
+                Response::Found(found) => Ok(found),
+                Response::Error { message } => Err(message),
+                other => Err(unexpected(&other)),
+            };
+        }
+        let filter = request.filter()?;
+        let scope: Vec<(PathBuf, &Node)> = if let Some(path) = &request.path {
             let located = self.locate(path)?;
             vec![(located.path, located.node)]
         } else {
@@ -557,34 +713,55 @@ impl Session {
                 .map(|scan| (scan.root.clone(), &*scan.tree))
                 .collect()
         };
+        let mut all = FoundList::default();
         for (path, node) in &scope {
-            for child in &node.children {
-                filter.collect(&path.join(&*child.name), child, &mut found);
-            }
+            let found =
+                FoundList::of(&query::find(path, node, &filter, request.limit));
+            all.matches.extend(found.matches);
+            all.count += found.count;
+            all.bytes += found.bytes;
         }
-        found.sort_by_key(|(_, node)| std::cmp::Reverse(node.bytes));
-        let total: u64 = found.iter().map(|(_, node)| node.bytes).sum();
-        let count = found.len();
-        let mut out = String::new();
-        let where_ = match &params.path {
-            Some(path) => self.show(&self.absolute(path)?),
-            None => "the scanned roots".to_string(),
+        all.matches
+            .sort_by_key(|found| std::cmp::Reverse(found.entry.bytes));
+        all.matches.truncate(request.limit);
+        Ok(all)
+    }
+
+    /// The largest entries matching the filters, topmost matches only.
+    pub fn find(&mut self, params: &FindParams) -> Result<String, String> {
+        let now = now();
+        let path = match &params.path {
+            Some(path) => Some(self.absolute(path)?),
+            None => None,
         };
-        if count == 0 {
+        let request = params.request(path.clone(), now);
+        let found = self.found(&request)?;
+        let where_ = match (&path, &self.window) {
+            (Some(path), _) => self.show(path),
+            (None, Some(state)) if self.link.is_some() => {
+                self.show(&state.root)
+            }
+            (None, _) => "the scanned roots".to_string(),
+        };
+        let mut out = String::new();
+        if found.count == 0 {
             let _ = writeln!(out, "Nothing under {where_} matches.");
             return Ok(out);
         }
         let _ = writeln!(
             out,
-            "{count} match{} under {where_}, {} in all; the largest {}:",
-            if count == 1 { "" } else { "es" },
-            human_bytes(total),
-            count.min(limit),
+            "{} match{} under {where_}, {} in all; the largest {}:",
+            found.count,
+            if found.count == 1 { "" } else { "es" },
+            human_bytes(found.bytes),
+            found.matches.len(),
         );
-        for (path, node) in found.iter().take(limit) {
-            let _ =
-                writeln!(out, "{}", row(node, &self.show(path), total, now));
-        }
+        out.push_str(&matches(
+            &found.matches,
+            found.bytes,
+            now,
+            self.home.as_deref(),
+        ));
         Ok(out)
     }
 
@@ -662,18 +839,22 @@ impl Session {
             .to_string())
     }
 
-    /// Send one request. A failed link is dropped, so the next call tries
-    /// again from the start.
+    /// Send one request. Every answer that carries the window's state is
+    /// adopted. A failed link is dropped, so the next call tries again
+    /// from the start.
     fn call(&mut self, request: &Request) -> Result<Response, String> {
         let Some(link) = &mut self.link else {
             return Err("the window is not linked".to_string());
         };
         match link.call(request) {
-            Ok(Response::State(state)) => {
-                self.adopt(&state);
-                Ok(Response::State(state))
+            Ok(response) => {
+                if let Response::State(state) | Response::Marked { state, .. } =
+                    &response
+                {
+                    self.adopt(state);
+                }
+                Ok(response)
             }
-            Ok(response) => Ok(response),
             Err(error) => {
                 self.link = None;
                 self.window = None;
@@ -730,16 +911,27 @@ impl Session {
             root: root.to_path_buf(),
             path: path.clone(),
         })? {
-            Response::Ok | Response::State(_) => {
-                Ok(format!("Window: showing {}.\n", self.show(&path)))
-            }
             Response::Error { message } => Err(message),
+            _ => Ok(format!("Window: showing {}.\n", self.show(&path))),
         }
     }
 
     pub fn show_path(&mut self, params: &ShowParams) -> Result<String, String> {
-        let root = self.locate(&params.path)?.scan.root.clone();
-        self.show_in_window(&root, &params.path)
+        let path = self.absolute(&params.path)?;
+        let root = if self.try_connect() {
+            // A path outside the window but inside a scan held here moves
+            // the window to that scan's root; one in neither is an error.
+            match self.window_root_for(&path) {
+                Ok(root) => root,
+                Err(outside) => self
+                    .locate(&path)
+                    .map(|found| found.scan.root.clone())
+                    .map_err(|_| outside)?,
+            }
+        } else {
+            self.locate(&path)?.scan.root.clone()
+        };
+        self.show_in_window(&root, &path)
     }
 
     /// What the window is doing, in one line, for the end of a report.
@@ -749,17 +941,29 @@ impl Session {
             let _ = self.call(&Request::State);
         }
         match &self.window {
-            Some(state) => format!(
-                "Window: open on {}, {} screen{}{}.",
-                self.show(&state.root),
-                state.screen,
-                if state.scanning { ", scanning" } else { "" },
-                match state.marks.len() {
-                    0 => String::new(),
-                    1 => ", 1 mark".to_string(),
-                    n => format!(", {n} marks"),
-                },
-            ),
+            Some(state) => {
+                let tree = match &state.tree {
+                    Some(tree) => format!(
+                        " ({} \u{00b7} {} files \u{00b7} scanned {})",
+                        human_bytes(tree.bytes),
+                        human_count(tree.files),
+                        age(now(), tree.scanned_at)
+                    ),
+                    None => String::new(),
+                };
+                format!(
+                    "Window: open on {}{tree}, {} screen{}{}. Its tree is \
+                     what disktree_ls and disktree_find read.",
+                    self.show(&state.root),
+                    state.screen,
+                    if state.scanning { ", scanning" } else { "" },
+                    match state.marks.len() {
+                        0 => String::new(),
+                        1 => ", 1 mark".to_string(),
+                        n => format!(", {n} marks"),
+                    },
+                )
+            }
             None if self.launcher.is_some() => {
                 "Window: none open. disktree_review opens one on the marks \
                  for the user to confirm; disktree_show opens one on a path."
@@ -777,9 +981,92 @@ impl Session {
         if params.paths.is_empty() {
             return Err("give at least one path to mark".to_string());
         }
-        let mut targets = Vec::new();
-        let mut refused = Vec::new();
+        let mut paths = Vec::new();
         for path in &params.paths {
+            paths.push(self.absolute(path)?);
+        }
+        let refused = if self.try_connect() {
+            self.mark_in_window(&paths)?
+        } else {
+            self.mark_here(&paths)?
+        };
+        let mut report = String::new();
+        if !refused.is_empty() {
+            let _ = writeln!(report, "Not marked:");
+            for reason in &refused {
+                let _ = writeln!(report, "  {reason}");
+            }
+        }
+        report.push_str(&self.plan_report());
+        Ok(report)
+    }
+
+    /// Mark in the window, which measures each path from its own tree.
+    /// Returns what was refused, or an error when nothing could be marked.
+    fn mark_in_window(
+        &mut self,
+        paths: &[PathBuf],
+    ) -> Result<Vec<String>, String> {
+        let mut refused = Vec::new();
+        let mut targets = Vec::new();
+        let mut root = None;
+        for path in paths {
+            let window_root = match self.window_root_for(path) {
+                Ok(root) => root,
+                Err(reason) => {
+                    refused.push(reason);
+                    continue;
+                }
+            };
+            if *path == window_root {
+                refused.push(format!(
+                    "{} is the scanned root; mark what is inside it instead",
+                    self.show(path)
+                ));
+                continue;
+            }
+            // A scan held here may know the size already; the window
+            // measures regardless.
+            let (bytes, is_dir) = self
+                .locate(path)
+                .map_or((0, false), |f| (f.node.bytes, f.node.is_dir()));
+            targets.push(MarkRequest {
+                path: path.clone(),
+                bytes,
+                is_dir,
+            });
+            root = Some(window_root);
+        }
+        let Some(root) = root else {
+            return Err(refused.join("\n"));
+        };
+        match self.call(&Request::Mark { root, targets })? {
+            Response::Marked { refused: more, .. } => {
+                for item in more {
+                    // The window's reason usually names the path already.
+                    let shown = self.show(&item.path);
+                    refused.push(if item.reason.contains(&shown) {
+                        item.reason
+                    } else {
+                        format!("{shown}: {}", item.reason)
+                    });
+                }
+            }
+            Response::State(_) => {}
+            Response::Error { message } => return Err(message),
+            other => return Err(unexpected(&other)),
+        }
+        if self.marks.is_empty() && !refused.is_empty() {
+            return Err(refused.join("\n"));
+        }
+        Ok(refused)
+    }
+
+    /// Mark against this process's own scans, with no window to ask.
+    fn mark_here(&mut self, paths: &[PathBuf]) -> Result<Vec<String>, String> {
+        let mut refused = Vec::new();
+        let mut targets = Vec::new();
+        for path in paths {
             let found = match self.locate(path) {
                 Ok(found) => found,
                 Err(reason) => {
@@ -794,57 +1081,22 @@ impl Session {
                 ));
                 continue;
             }
-            targets.push((
-                found.scan.root.clone(),
-                Target {
-                    hidden: is_hidden(&found.path),
-                    is_dir: found.node.is_dir(),
-                    bytes: found.node.bytes,
-                    path: found.path,
-                },
-            ));
+            targets.push(Target {
+                hidden: is_hidden(&found.path),
+                is_dir: found.node.is_dir(),
+                bytes: found.node.bytes,
+                path: found.path,
+            });
         }
         if targets.is_empty() {
             return Err(refused.join("\n"));
         }
-        if self.try_connect() {
-            let roots: Vec<PathBuf> = targets
-                .iter()
-                .map(|(root, _)| root.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            for root in roots {
-                let requests: Vec<MarkRequest> = targets
-                    .iter()
-                    .filter(|(scan_root, _)| *scan_root == root)
-                    .map(|(_, target)| MarkRequest {
-                        path: target.path.clone(),
-                        bytes: target.bytes,
-                        is_dir: target.is_dir,
-                    })
-                    .collect();
-                self.call(&Request::Mark {
-                    root,
-                    targets: requests,
-                })?;
-            }
-        } else {
-            for (_, target) in targets {
-                if !self.marks.iter().any(|known| known.path == target.path) {
-                    self.marks.push(target);
-                }
+        for target in targets {
+            if !self.marks.iter().any(|known| known.path == target.path) {
+                self.marks.push(target);
             }
         }
-        let mut report = String::new();
-        if !refused.is_empty() {
-            let _ = writeln!(report, "Not marked:");
-            for reason in &refused {
-                let _ = writeln!(report, "  {reason}");
-            }
-        }
-        report.push_str(&self.plan_report());
-        Ok(report)
+        Ok(refused)
     }
 
     /// Unmark paths, or everything.
@@ -863,21 +1115,22 @@ impl Session {
         Ok(self.plan_report())
     }
 
-    /// The scan roots the marks fall under, each once.
+    /// The scan roots the marks fall under, each once: the window's root
+    /// when it covers a mark, else a scan's here, else the mark's parent.
     fn roots_of(&self, marks: &[Target]) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
         for mark in marks {
             let root = self
-                .scans
-                .iter()
-                .filter(|scan| mark.path.starts_with(&scan.root))
-                .max_by_key(|scan| scan.root.as_os_str().len())
-                .map(|scan| scan.root.clone())
+                .window
+                .as_ref()
+                .filter(|state| mark.path.starts_with(&state.root))
+                .map(|state| state.root.clone())
                 .or_else(|| {
-                    self.window
-                        .as_ref()
-                        .filter(|state| mark.path.starts_with(&state.root))
-                        .map(|state| state.root.clone())
+                    self.scans
+                        .iter()
+                        .filter(|scan| mark.path.starts_with(&scan.root))
+                        .max_by_key(|scan| scan.root.as_os_str().len())
+                        .map(|scan| scan.root.clone())
                 })
                 .unwrap_or_else(|| {
                     mark.path
@@ -913,78 +1166,84 @@ impl Session {
                 .filter(|mark| mark.path.starts_with(&root))
                 .cloned()
                 .collect();
-            let plan = plan(&mine, &root);
-            for target in &plan.targets {
+            out.push_str(&self.plan_for(&mine, &root));
+        }
+        out.push_str(&self.window_line());
+        out
+    }
+
+    /// The plan for the marks under one root: targets, what another mark
+    /// covers, what the guards keep back, and the space it frees.
+    fn plan_for(&self, mine: &[Target], root: &Path) -> String {
+        let mut out = String::new();
+        let plan = plan(mine, root);
+        for target in &plan.targets {
+            let _ = writeln!(
+                out,
+                "  {:>9}  {}{}",
+                human_bytes(target.bytes),
+                self.show(&target.path),
+                if target.is_dir { "/" } else { "" },
+            );
+        }
+        if !plan.covered.is_empty() {
+            let _ = writeln!(
+                out,
+                "Covered by another mark ({}): {}",
+                plan.covered.len(),
+                plan.covered
+                    .iter()
+                    .map(|target| self.show(&target.path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !plan.blocked.is_empty() {
+            let _ = writeln!(out, "Kept back ({}):", plan.blocked.len());
+            for blocked in &plan.blocked {
                 let _ = writeln!(
                     out,
-                    "  {:>9}  {}{}",
-                    human_bytes(target.bytes),
-                    self.show(&target.path),
-                    if target.is_dir { "/" } else { "" },
-                );
-            }
-            if !plan.covered.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "Covered by another mark ({}): {}",
-                    plan.covered.len(),
-                    plan.covered
-                        .iter()
-                        .map(|target| self.show(&target.path))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            if !plan.blocked.is_empty() {
-                let _ = writeln!(out, "Kept back ({}):", plan.blocked.len());
-                for blocked in &plan.blocked {
-                    let _ = writeln!(
-                        out,
-                        "  {}  {}",
-                        self.show(&blocked.path),
-                        blocked.reason
-                    );
-                }
-            }
-            let space = space_info(&root).ok();
-            let device = device_for(&root);
-            match space {
-                Some(space) => {
-                    let after = space.after_removing(plan.reclaim());
-                    let _ = writeln!(
-                        out,
-                        "Frees {} on {}: {} free now, {} after.",
-                        human_bytes(plan.reclaim()),
-                        device.unwrap_or_else(|| self.show(&root)),
-                        human_bytes(space.available),
-                        human_bytes(after.available),
-                    );
-                }
-                None => {
-                    let _ = writeln!(
-                        out,
-                        "Frees {} on the volume of {}.",
-                        human_bytes(plan.reclaim()),
-                        self.show(&root)
-                    );
-                }
-            }
-            if plan.foreign() > 0 {
-                let _ = writeln!(
-                    out,
-                    "Plus {} on other volumes, not counted above.",
-                    human_bytes(plan.foreign())
-                );
-            }
-            if plan.unattributed() > 0 {
-                let _ = writeln!(
-                    out,
-                    "{} whose volume cannot be told is not counted either.",
-                    human_bytes(plan.unattributed())
+                    "  {}  {}",
+                    self.show(&blocked.path),
+                    blocked.reason
                 );
             }
         }
-        out.push_str(&self.window_line());
+        match space_info(root).ok() {
+            Some(space) => {
+                let after = space.after_removing(plan.reclaim());
+                let _ = writeln!(
+                    out,
+                    "Frees {} on {}: {} free now, {} after.",
+                    human_bytes(plan.reclaim()),
+                    device_for(root).unwrap_or_else(|| self.show(root)),
+                    human_bytes(space.available),
+                    human_bytes(after.available),
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "Frees {} on the volume of {}.",
+                    human_bytes(plan.reclaim()),
+                    self.show(root)
+                );
+            }
+        }
+        if plan.foreign() > 0 {
+            let _ = writeln!(
+                out,
+                "Plus {} on other volumes, not counted above.",
+                human_bytes(plan.foreign())
+            );
+        }
+        if plan.unattributed() > 0 {
+            let _ = writeln!(
+                out,
+                "{} whose volume cannot be told is not counted either.",
+                human_bytes(plan.unattributed())
+            );
+        }
         out
     }
 
@@ -1001,9 +1260,8 @@ impl Session {
             .next()
             .ok_or("no root for the marks")?;
         self.ensure_link(&root)?;
-        match self.call(&Request::Review)? {
-            Response::Error { message } => return Err(message),
-            Response::Ok | Response::State(_) => {}
+        if let Response::Error { message } = self.call(&Request::Review)? {
+            return Err(message);
         }
         let _ = self.call(&Request::State);
         let total: u64 = self.marks.iter().map(|mark| mark.bytes).sum();
@@ -1031,13 +1289,22 @@ impl Session {
             env!("CARGO_PKG_VERSION"),
             self.client
         );
+        out.push_str(&self.window_line());
+        out.push('\n');
         if self.scans.is_empty() {
-            out.push_str(
-                "Scans: none yet. disktree_scan with no arguments scans the \
-                 home directory in seconds; disk: true scans the volume.\n",
-            );
+            if self.link.is_none() {
+                out.push_str(
+                    "Scans: none yet. disktree_scan with no arguments scans \
+                     the home directory in seconds; disk: true scans the \
+                     volume.\n",
+                );
+            }
         } else {
-            out.push_str("Scans:\n");
+            out.push_str(if self.link.is_some() {
+                "Scans held here, unused while the window is open:\n"
+            } else {
+                "Scans:\n"
+            });
             for scan in &self.scans {
                 let _ = writeln!(
                     out,
@@ -1051,8 +1318,6 @@ impl Session {
                 );
             }
         }
-        out.push_str(&self.window_line());
-        out.push('\n');
         if let Some(removal) =
             self.window.as_ref().and_then(|state| state.removal.clone())
         {
@@ -1086,39 +1351,47 @@ impl Session {
                 human_bytes(total)
             );
         }
-        let volumes: Vec<_> =
-            volumes().into_iter().filter(worth_listing).collect();
-        if !volumes.is_empty() {
-            out.push_str("Volumes, fullest first:\n");
-            for volume in volumes.iter().take(8) {
-                match volume.space {
-                    Some(space) => {
-                        let _ =
-                            writeln!(
-                                out,
-                                "  {}  {} free of {} ({:.0}% used){}",
-                                volume.point.display(),
-                                human_bytes(space.available),
-                                human_bytes(space.total),
-                                f64::from(space.used_fraction()) * 100.0,
-                                volume.device.as_deref().map_or_else(
-                                    String::new,
-                                    |device| format!("  {device}")
-                                ),
-                            );
-                    }
-                    None => {
-                        let _ = writeln!(
-                            out,
-                            "  {}  free space unknown",
-                            volume.point.display()
-                        );
-                    }
-                }
-            }
-        }
+        out.push_str(&volumes_report());
         out
     }
+}
+
+/// Every volume a person would call a disk, fullest first.
+fn volumes_report() -> String {
+    let mut out = String::new();
+    let volumes: Vec<_> = volumes().into_iter().filter(worth_listing).collect();
+    if volumes.is_empty() {
+        return out;
+    }
+    out.push_str("Volumes, fullest first:\n");
+    for volume in volumes.iter().take(8) {
+        match volume.space {
+            Some(space) => {
+                let _ = writeln!(
+                    out,
+                    "  {}  {} free of {} ({:.0}% used){}",
+                    volume.point.display(),
+                    human_bytes(space.available),
+                    human_bytes(space.total),
+                    f64::from(space.used_fraction()) * 100.0,
+                    volume
+                        .device
+                        .as_deref()
+                        .map_or_else(String::new, |device| format!(
+                            "  {device}"
+                        )),
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  {}  free space unknown",
+                    volume.point.display()
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Whether a volume is one a person would call a disk: the system's own
@@ -1148,7 +1421,7 @@ fn worth_listing(volume: &disktree_core::space::Volume) -> bool {
         && volume.space.is_some_and(|space| space.total >= GIB)
 }
 
-/// Where a path landed in a scan.
+/// Where a path landed in a scan held here.
 struct Located<'a> {
     scan: &'a Scan,
     path: PathBuf,
@@ -1156,56 +1429,53 @@ struct Located<'a> {
     node: &'a Node,
 }
 
-/// What `disktree_find` keeps.
-struct Filter {
-    kind: Kind,
-    min_bytes: u64,
-    category: Option<Category>,
-    reclaimable: bool,
-    name: Option<String>,
-    /// Only entries last written before this Unix time.
-    before: Option<i64>,
+/// What a scan report is made of, whichever side did the walking.
+struct ScanFacts {
+    root: PathBuf,
+    tree: TreeSummary,
+    space: Option<Space>,
+    device: Option<String>,
+    top: Listing,
+    insights: Vec<Insight>,
 }
 
-impl Filter {
-    fn matches(&self, node: &Node) -> bool {
-        let kind_ok = match self.kind {
-            Kind::Any => true,
-            Kind::File => !node.is_dir(),
-            Kind::Dir => node.is_dir(),
-        };
-        kind_ok
-            && node.bytes >= self.min_bytes
-            && self
-                .category
-                .is_none_or(|category| node.category == category)
-            && (!self.reclaimable || node.reclaim.is_some())
-            && self
-                .name
-                .as_deref()
-                .is_none_or(|name| node.name.to_lowercase().contains(name))
-            && self.before.is_none_or(|before| {
-                node.modified > 0 && node.modified < before
-            })
-    }
-
-    /// Collect matches beneath `node`, topmost only. Sizes shrink going
-    /// down, so a node below the minimum ends the walk there.
-    fn collect<'a>(
-        &self,
-        path: &Path,
-        node: &'a Node,
-        found: &mut Vec<(PathBuf, &'a Node)>,
-    ) {
-        if node.bytes < self.min_bytes || node.kind == NodeKind::Other {
-            return;
-        }
-        if self.matches(node) {
-            found.push((path.to_path_buf(), node));
-            return;
-        }
-        for child in &node.children {
-            self.collect(&path.join(&*child.name), child, found);
+impl ScanFacts {
+    fn of_local(scan: &Scan) -> Self {
+        Self {
+            root: scan.root.clone(),
+            tree: TreeSummary {
+                bytes: scan.tree.bytes,
+                files: scan.tree.files,
+                dirs: u64::from(scan.tree.dirs),
+                scanned_at: scan.at,
+                elapsed_ms: u64::try_from(scan.elapsed.as_millis())
+                    .unwrap_or(u64::MAX),
+                unreadable: scan.unreadable,
+                apparent_size: scan.options.apparent_size,
+                include_hidden: scan.options.include_hidden,
+            },
+            space: scan.space.map(|space| Space {
+                total: space.total,
+                free: space.free,
+                available: space.available,
+            }),
+            device: scan.device.clone(),
+            top: Listing::of(
+                &scan.root,
+                scan.tree.bytes,
+                &scan.root,
+                &scan.tree,
+                TOP,
+            ),
+            insights: scan
+                .insights
+                .iter()
+                .map(|candidate| Insight {
+                    path: path_of(&scan.root, &scan.tree, &candidate.crumbs),
+                    bytes: candidate.bytes,
+                    what: candidate.finding.describe(),
+                })
+                .collect(),
         }
     }
 }
@@ -1216,21 +1486,19 @@ fn is_hidden(path: &Path) -> bool {
         .is_some_and(|name| name.to_string_lossy().starts_with('.'))
 }
 
-/// A finding, as a few words after its size.
-fn finding_text(finding: &Finding) -> String {
-    match finding {
-        Finding::Reclaimable(reclaim) => {
-            format!("reclaimable: {}", reclaim_name(*reclaim))
+/// An answer of a shape the request does not take: an old window.
+fn unexpected(response: &Response) -> String {
+    format!(
+        "the window answered with something unexpected ({}); restart it",
+        match response {
+            Response::State(_) => "state",
+            Response::Marked { .. } => "marked",
+            Response::Listing(_) => "listing",
+            Response::Found(_) => "found",
+            Response::Ok => "ok",
+            Response::Error { .. } => "error",
         }
-        Finding::Worktrees { count, oldest_days } => format!(
-            "{count} agent worktree{}, the oldest {oldest_days} d old",
-            if *count == 1 { "" } else { "s" }
-        ),
-        Finding::StaleExperiments { count } => format!(
-            "{count} experiment{} untouched for a month or more",
-            if *count == 1 { "" } else { "s" }
-        ),
-    }
+    )
 }
 
 /// Walk `root` with `options` and keep what is needed later. Blocking;
@@ -1267,11 +1535,11 @@ pub fn run_scan(root: PathBuf, options: ScanOptions) -> Result<Scan, String> {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use disktree_link::{Incoming, Listener, Mark, Removal};
+    use disktree_link::{Incoming, Listener, Mark, Refused, Removal};
+    #[cfg(unix)]
+    use std::sync::Mutex;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicBool, Ordering};
-    #[cfg(unix)]
-    use std::sync::{Arc, Mutex};
     #[cfg(unix)]
     use std::thread;
 
@@ -1296,14 +1564,26 @@ mod tests {
     }
 
     /// Apparent sizes, so the numbers are the bytes written, not blocks.
+    #[cfg(unix)]
+    fn apparent() -> ScanOptions {
+        ScanOptions {
+            apparent_size: true,
+            ..ScanOptions::default()
+        }
+    }
+
+    /// Scan here, as the server does when no window is open.
     fn scanned(session: &mut Session, root: &Path) -> String {
-        let (root, options) = session
+        let plan = session
             .prepare_scan(&ScanParams {
                 path: Some(root.to_path_buf()),
                 apparent_size: true,
                 ..ScanParams::default()
             })
             .expect("prepare");
+        let ScanPlan::Local { root, options } = plan else {
+            panic!("no window, so the scan runs here: {plan:?}");
+        };
         let scan = run_scan(root, options).expect("scan");
         session.store_scan(scan)
     }
@@ -1371,7 +1651,7 @@ mod tests {
 
         let files = session
             .find(&FindParams {
-                kind: Some(Kind::File),
+                kind: Some(KindName::File),
                 min_bytes: Some(200_000),
                 ..FindParams::default()
             })
@@ -1468,14 +1748,138 @@ mod tests {
         assert!(review.contains("Nothing is marked"), "{review}");
     }
 
-    /// A stand-in for the window: answers over the real socket the way the
-    /// app does, and records what it was asked.
+    /// A stand-in for the window: holds a real tree of the fixture, answers
+    /// over the real socket the way the app does, and records what it was
+    /// asked.
     #[cfg(unix)]
     struct FakeWindow {
         listener: Arc<Listener>,
         asked: Arc<Mutex<Vec<Request>>>,
         marks: Arc<Mutex<Vec<Mark>>>,
         stop: Arc<AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    struct FakeTree {
+        root: PathBuf,
+        tree: Arc<Node>,
+        marks: Vec<Mark>,
+    }
+
+    #[cfg(unix)]
+    impl FakeTree {
+        fn state(&self, screen: &str) -> State {
+            State {
+                version: VERSION,
+                root: self.root.clone(),
+                current: self.root.clone(),
+                screen: screen.into(),
+                scanning: false,
+                scanned: true,
+                marks: self.marks.clone(),
+                space: None,
+                removal: Some(Removal {
+                    mode: "trash".into(),
+                    removed: 2,
+                    failed: 0,
+                    bytes: 700_000,
+                    freed: Some(690_000),
+                    at: now() - 120,
+                }),
+                tree: Some(TreeSummary {
+                    bytes: self.tree.bytes,
+                    files: self.tree.files,
+                    dirs: u64::from(self.tree.dirs),
+                    scanned_at: now() - 30,
+                    elapsed_ms: 1_500,
+                    unreadable: 0,
+                    apparent_size: true,
+                    include_hidden: true,
+                }),
+                insights: vec![Insight {
+                    path: self.root.join(".cache"),
+                    bytes: 400_000,
+                    what: "reclaimable: cache".into(),
+                }],
+            }
+        }
+
+        fn answer(&mut self, request: &Request) -> Response {
+            match request {
+                Request::Hello { .. } | Request::State => {
+                    Response::State(self.state("explore"))
+                }
+                Request::Scan { root, .. } => {
+                    assert_eq!(*root, self.root, "the fake has one tree");
+                    Response::State(self.state("explore"))
+                }
+                Request::Ls { path, limit } => {
+                    let Some((_, node)) = path
+                        .strip_prefix(&self.root)
+                        .ok()
+                        .and_then(|relative| self.tree.descend(relative))
+                    else {
+                        return Response::error("not in the window's tree");
+                    };
+                    Response::Listing(Listing::of(
+                        &self.root,
+                        self.tree.bytes,
+                        path,
+                        node,
+                        *limit,
+                    ))
+                }
+                Request::Find(request) => {
+                    let filter = match request.filter() {
+                        Ok(filter) => filter,
+                        Err(message) => return Response::error(message),
+                    };
+                    let found = query::find(
+                        &self.root,
+                        &self.tree,
+                        &filter,
+                        request.limit,
+                    );
+                    Response::Found(FoundList::of(&found))
+                }
+                Request::Mark { targets, .. } => {
+                    let mut refused = Vec::new();
+                    for target in targets {
+                        let node =
+                            target.path.strip_prefix(&self.root).ok().and_then(
+                                |relative| self.tree.descend(relative),
+                            );
+                        let Some((_, node)) = node else {
+                            refused.push(Refused {
+                                path: target.path.clone(),
+                                reason: "not in the window's tree".into(),
+                            });
+                            continue;
+                        };
+                        if !self.marks.iter().any(|m| m.path == target.path) {
+                            self.marks.push(Mark {
+                                path: target.path.clone(),
+                                bytes: node.bytes,
+                                is_dir: node.is_dir(),
+                            });
+                        }
+                    }
+                    Response::Marked {
+                        state: self.state("explore"),
+                        refused,
+                    }
+                }
+                Request::Unmark { paths } if paths.is_empty() => {
+                    self.marks.clear();
+                    Response::State(self.state("explore"))
+                }
+                Request::Unmark { paths } => {
+                    self.marks.retain(|mark| !paths.contains(&mark.path));
+                    Response::State(self.state("explore"))
+                }
+                Request::Show { .. } | Request::Review => Response::Ok,
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1491,7 +1895,13 @@ mod tests {
                 Arc::clone(&marks),
                 Arc::clone(&stop),
             );
-            let root = root.to_path_buf();
+            let mut fake = FakeTree {
+                root: root.to_path_buf(),
+                tree: Arc::new(
+                    disktree_core::scan::scan(root, apparent()).expect("scan"),
+                ),
+                marks: Vec::new(),
+            };
             thread::spawn(move || {
                 while !s.load(Ordering::Relaxed) {
                     for incoming in l.drain() {
@@ -1499,61 +1909,9 @@ mod tests {
                             incoming
                         {
                             a.lock().expect("asked").push(request.clone());
-                            let mut marks = m.lock().expect("marks");
-                            match &request {
-                                Request::Mark { targets, .. } => {
-                                    for target in targets {
-                                        if !marks.iter().any(|mark| {
-                                            mark.path == target.path
-                                        }) {
-                                            marks.push(Mark {
-                                                path: target.path.clone(),
-                                                bytes: target.bytes,
-                                                is_dir: target.is_dir,
-                                            });
-                                        }
-                                    }
-                                }
-                                Request::Unmark { paths }
-                                    if paths.is_empty() =>
-                                {
-                                    marks.clear();
-                                }
-                                Request::Unmark { paths } => {
-                                    marks.retain(|mark| {
-                                        !paths.contains(&mark.path)
-                                    });
-                                }
-                                _ => {}
-                            }
-                            let state = State {
-                                version: VERSION,
-                                root: root.clone(),
-                                current: root.clone(),
-                                screen: if matches!(request, Request::Review) {
-                                    "review".into()
-                                } else {
-                                    "explore".into()
-                                },
-                                scanning: false,
-                                scanned: true,
-                                marks: marks.clone(),
-                                space: None,
-                                removal: Some(Removal {
-                                    mode: "trash".into(),
-                                    removed: 2,
-                                    failed: 0,
-                                    bytes: 700_000,
-                                    freed: Some(690_000),
-                                    at: now() - 120,
-                                }),
-                            };
-                            reply.send(match request {
-                                Request::Show { .. } | Request::Review => {
-                                    Response::Ok
-                                }
-                                _ => Response::State(state),
-                            });
+                            let response = fake.answer(&request);
+                            m.lock().expect("marks").clone_from(&fake.marks);
+                            reply.send(response);
                         }
                     }
                     thread::sleep(Duration::from_millis(5));
@@ -1570,6 +1928,10 @@ mod tests {
         fn asked(&self) -> Vec<Request> {
             self.asked.lock().expect("asked").clone()
         }
+
+        fn marks(&self) -> Vec<Mark> {
+            self.marks.lock().expect("marks").clone()
+        }
     }
 
     #[cfg(unix)]
@@ -1577,7 +1939,106 @@ mod tests {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             let _ = &self.listener;
-            let _ = &self.marks;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_a_window_open_its_tree_is_what_the_agent_reads() {
+        let temp = fixture();
+        let socket = temp.path().join("window.sock");
+        let window = FakeWindow::open(&socket, temp.path());
+        let mut session = Session::detached(socket, None);
+        session.set_client("claude-code");
+        // No scan here at all: everything comes from the window.
+        assert!(session.scans().is_empty());
+
+        let listing = session
+            .ls(&LsParams {
+                path: temp.path().join("src"),
+                limit: Some(5),
+                show: false,
+            })
+            .expect("ls over the link");
+        assert!(listing.contains("app/"), "{listing}");
+        assert!(listing.contains("% of "), "{listing}");
+
+        let outside = session
+            .ls(&LsParams {
+                path: PathBuf::from("/definitely/elsewhere"),
+                ..LsParams::default()
+            })
+            .expect_err("outside the window");
+        assert!(outside.contains("window's tree"), "{outside}");
+        assert!(outside.contains("disktree_scan"), "{outside}");
+
+        let reclaim = session
+            .find(&FindParams {
+                reclaimable: true,
+                ..FindParams::default()
+            })
+            .expect("find over the link");
+        assert!(reclaim.contains(".cache/"), "{reclaim}");
+        assert!(reclaim.contains("target/"), "{reclaim}");
+
+        // The window measures the mark; a path it does not have is refused.
+        let plan = session
+            .mark(&PathsParams {
+                paths: vec![
+                    temp.path().join(".cache"),
+                    temp.path().join("not-there"),
+                ],
+            })
+            .expect("mark");
+        assert!(plan.starts_with("Not marked:"), "{plan}");
+        assert!(plan.contains("not in the window's tree"), "{plan}");
+        assert!(plan.contains("Marked 1"), "{plan}");
+        assert_eq!(window.marks()[0].bytes, 400_000);
+        assert_eq!(session.marks()[0].bytes, 400_000);
+
+        // A scan goes to the window and is read back from it.
+        let plan = session
+            .prepare_scan(&ScanParams {
+                path: Some(temp.path().to_path_buf()),
+                apparent_size: true,
+                ..ScanParams::default()
+            })
+            .expect("prepare");
+        let ScanPlan::Window { root } = plan else {
+            panic!("a linked window scans: {plan:?}");
+        };
+        let report = session
+            .window_scan(&root)
+            .expect("poll")
+            .expect("the fake finishes at once");
+        assert!(report.starts_with("Scanned "), "{report}");
+        assert!(report.contains("6 files"), "{report}");
+        assert!(report.contains("Top level, largest first:"), "{report}");
+        assert!(report.contains("reclaimable: cache"), "{report}");
+        assert!(report.contains("Window: open on"), "{report}");
+        assert!(session.scans().is_empty(), "nothing is scanned here");
+
+        let status = session.status();
+        assert!(status.contains("Claude Code"), "{status}");
+        assert!(status.contains("Last removal: trash"), "{status}");
+        assert!(status.contains("scanned "), "{status}");
+        assert!(!status.contains("Scans: none yet"), "{status}");
+
+        let asked = window.asked();
+        assert!(
+            matches!(asked[0], Request::Hello { ref client, .. } if client == "Claude Code")
+        );
+        for wanted in ["ls", "find", "mark", "scan"] {
+            assert!(
+                asked.iter().any(|request| match request {
+                    Request::Ls { .. } => wanted == "ls",
+                    Request::Find(_) => wanted == "find",
+                    Request::Mark { .. } => wanted == "mark",
+                    Request::Scan { .. } => wanted == "scan",
+                    _ => false,
+                }),
+                "{wanted} went to the window: {asked:?}"
+            );
         }
     }
 
@@ -1588,8 +2049,6 @@ mod tests {
         let socket = temp.path().join("window.sock");
         let window = FakeWindow::open(&socket, temp.path());
         let mut session = Session::detached(socket, None);
-        session.set_client("claude-code");
-        scanned(&mut session, temp.path());
 
         let plan = session
             .mark(&PathsParams {
@@ -1612,20 +2071,7 @@ mod tests {
         let review = session.review().expect("review");
         assert!(review.contains("review screen is open"), "{review}");
 
-        let status = session.status();
-        assert!(status.contains("Claude Code"), "{status}");
-        assert!(status.contains("Last removal: trash"), "{status}");
-        assert!(status.contains("review screen"), "{status}");
-
         let asked = window.asked();
-        assert!(
-            matches!(asked[0], Request::Hello { ref client, .. } if client == "Claude Code")
-        );
-        assert!(
-            asked
-                .iter()
-                .any(|request| matches!(request, Request::Mark { .. }))
-        );
         assert!(
             asked
                 .iter()
