@@ -2114,6 +2114,13 @@ fn the_agent_overlay_opens_and_closes(cx: &mut TestAppContext) {
     assert!(!read(&view, cx, |app| app.show_agent));
     assert!(cx.debug_bounds("agent-overlay").is_none());
 
+    // The Help menu opens the same overlay.
+    cx.dispatch_action(crate::app_menu::ConnectAgent);
+    draw(cx);
+    assert!(read(&view, cx, |app| app.show_agent));
+    assert!(cx.debug_bounds("agent-overlay").is_some());
+    press(cx, "escape");
+
     let commands =
         crate::agent::connect_commands(Path::new("/opt/disktree/disktree"));
     assert_eq!(commands.len(), 3);

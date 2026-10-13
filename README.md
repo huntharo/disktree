@@ -261,8 +261,9 @@ claude mcp add --scope user disktree -- disktree mcp
 
 (Codex: `codex mcp add disktree -- disktree mcp`. Any other client: a
 server named `disktree` with the command `disktree` and the argument
-`mcp`. The window's **Work with an AI agent** line, under the disk, has
-each command with the binary's full path and a Copy button.)
+`mcp`. The window's **Work with an AI agent** line, under the disk, and
+**Help › Work with an AI Agent…** on macOS, show each command with the
+binary's full path and a Copy button.)
 
 Then ask it what is eating your disk. The agent walks the tree largest
 first, lists every cache, build directory and package store at once, and
