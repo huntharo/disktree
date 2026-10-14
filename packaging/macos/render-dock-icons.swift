@@ -228,10 +228,12 @@ for (name, rep) in [("AppIcon.svg", flat), ("the glass render", glass)] {
 }
 
 // The Default icon style keeps the mark's own colours; Clear and Tinted
-// replace them, and Dark darkens the tile. Two probes, well inside flat
-// areas: the mark's blue title bar, and the dark green block under it.
+// replace them, and Dark darkens the tile. Two probes that hold whatever
+// size AppGlyph.svg draws the mark at, as long as it is centred: the
+// canvas centre, which is the mark's dark green block, and the tile 50 px
+// in from its left edge, outside the mark and clear of the glass rim.
 // Lighting shifts them a little; a style change replaces them.
-for probe in [(x: 512, y: 220, label: "title bar"), (x: 300, y: 450, label: "green block")] {
+for probe in [(x: 512, y: 512, label: "green block"), (x: 150, y: 512, label: "tile")] {
     let authored = srgb(flat, x: probe.x, y: probe.y)
     let rendered = srgb(glass, x: probe.x, y: probe.y)
     guard authored.count == 4, rendered.count == 4,
