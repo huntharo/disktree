@@ -21,7 +21,7 @@
 
 use objc2::{AllocAnyThread as _, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSImage};
-use objc2_foundation::{NSBundle, NSData, NSProcessInfo, NSString};
+use objc2_foundation::{NSBundle, NSData, NSString};
 
 const FLAT: &[u8] = include_bytes!("../../../packaging/macos/DockIcon.png");
 const GLASS: &[u8] =
@@ -60,12 +60,20 @@ fn bundle_names_an_icon() -> bool {
     })
 }
 
-/// Whether this Mac draws app icons in Liquid Glass: macOS 26 and later.
+/// Whether this Mac draws app icons in Liquid Glass: macOS 26 and later,
+/// which is Darwin 25.
+///
+/// The kernel release, not `NSProcessInfo`: macOS 26 reports itself as 16.0
+/// to a binary linked against an older SDK, which is what a Mac with the
+/// Command Line Tools or Xcode 16 builds.
 fn draws_liquid_glass() -> bool {
-    NSProcessInfo::processInfo()
-        .operatingSystemVersion()
-        .majorVersion
-        >= 26
+    darwin_major(&rustix::system::uname().release().to_string_lossy())
+        .is_some_and(|major| major >= 25)
+}
+
+/// The major version of a Darwin release such as `25.6.0`.
+fn darwin_major(release: &str) -> Option<u32> {
+    release.split('.').next()?.parse().ok()
 }
 
 /// The icon for the look this Mac gives its icons.
@@ -94,5 +102,12 @@ mod tests {
         }
         // The glass one is a render of the flat one, never the same file.
         assert_ne!(embedded(true), embedded(false));
+    }
+
+    #[test]
+    fn darwin_25_is_the_first_to_draw_liquid_glass() {
+        assert_eq!(darwin_major("25.6.0"), Some(25));
+        assert_eq!(darwin_major("24.6.0"), Some(24));
+        assert_eq!(darwin_major(""), None);
     }
 }

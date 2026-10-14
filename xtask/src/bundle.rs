@@ -191,11 +191,12 @@ fn icon(svg: &Path, scratch: &Path, icns: &Path) -> Result<(), String> {
     )
 }
 
-/// The line of the plist template that the catalog's keys replace.
-const ICON_CATALOG_MARKER: &str = "\t@ICON_CATALOG@\n";
+/// The token in the plist template that the catalog's keys replace. Left
+/// empty without a catalog, it is a blank line inside the dict.
+const ICON_CATALOG_MARKER: &str = "@ICON_CATALOG@";
 /// What macOS 26 reads the icon by: the name actool gave it in `Assets.car`.
 const ICON_CATALOG_KEYS: &str =
-    "\t<key>CFBundleIconName</key>\n\t<string>Icon</string>\n";
+    "<key>CFBundleIconName</key>\n\t<string>Icon</string>";
 
 /// `Assets.car` from the Icon Composer package, when Xcode 26's actool is at
 /// hand; whether it was made.
@@ -457,7 +458,7 @@ mod tests {
         assert!(plist.contains(ICON_CATALOG_MARKER));
         assert!(!plist.contains("<key>CFBundleIconName</key>"));
         let without = plist.replace(ICON_CATALOG_MARKER, "");
-        assert!(!without.contains("@ICON_CATALOG@"));
+        assert!(!without.contains(ICON_CATALOG_MARKER));
         let with = plist.replace(ICON_CATALOG_MARKER, ICON_CATALOG_KEYS);
         assert!(with.contains("<key>CFBundleIconName</key>\n\t<string>Icon"));
     }
