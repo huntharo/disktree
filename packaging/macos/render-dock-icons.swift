@@ -241,7 +241,10 @@ for probe in [(x: 512, y: 220, label: "title bar"), (x: 300, y: 450, label: "gre
     }
 }
 
-write(draw(flatImage, at: output), to: flatOut)
+// sips at the output size, as the bundle's iconset is drawn, rather than a
+// resample of the 1024 px check render.
+rasterize(tileSVG, to: flatOut, pixels: output)
+print("  \(flatOut.lastPathComponent) (\(output) px)")
 let glassImage = NSImage(size: NSSize(width: canvas, height: canvas))
 glassImage.addRepresentation(glass)
 write(draw(glassImage, at: output), to: glassOut)
