@@ -93,8 +93,23 @@ What is different from Linux:
 - **Free space** is what `df` reports. Finder's figure is larger: it counts
   purgeable space (caches and local snapshots macOS will clear on its own).
 - **Cloned files** (copies APFS shares blocks between, as Finder's Duplicate
-  makes) are each counted in full, so a total can exceed what deleting them
-  frees.
+  makes) remain counted in full in the treemap. The scan line separately
+  reports bytes in cloned files and estimated repeated data-fork allocation.
+  The selection, review and permanent-delete confirmation estimate savings
+  from the accepted set of marks together. Complete clone groups credit
+  shared data once; a remaining hardlink retains its file data. Unknown or
+  modified sharing and allocation outside the data fork supply a range, with only its lower bound used by the
+  volume meter. Unknown private sizes contribute zero to that bound.
+  Snapshots and open files can retain blocks,
+  and changing files can stale the estimate; rescan to refresh it. The final
+  result still measures the volume's actual free-space change.
+  Clone hints come from bulk directory reads; only potentially shared files
+  need a private-size query. A bounded, sharded cache reuses confirmed full
+  clones within their observed reference count, separately on each real
+  APFS volume and each scan. Modified clones are measured individually.
+  Unsupported filesystems or kernels fall back to
+  the ordinary listing without clone detection. Apparent-size scans do not
+  collect clone metadata.
 - **Time Machine's local snapshots** are not files and do not appear; they
   are part of the gap between the scan and the disk's used space.
 - **Cloud-only folders** (iCloud Drive, Dropbox and the like, evicted to the

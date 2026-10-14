@@ -4,10 +4,10 @@
 //! decisions — what is selected, what a mark means, what a key does, when to
 //! re-scan — live here so they can be reasoned about in one place.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use disktree_core::access::file_table_readable;
@@ -321,6 +321,15 @@ pub struct RunSummary {
     pub failed: usize,
 }
 
+/// Scan-derived display estimates; never cached removal authorization.
+#[derive(Default)]
+struct AccountingCache {
+    tree: Weak<Node>,
+    root: PathBuf,
+    // Total and scanned-volume subsets only: bounded by the current marks.
+    estimates: Vec<(Vec<PathBuf>, disktree_core::sharing::Estimate)>,
+}
+
 /// Everything the app knows and everything it can do.
 pub struct Disktree {
     /// The directory the tree was scanned from.
@@ -360,6 +369,7 @@ pub struct Disktree {
     pub transition: Option<LayoutTransition>,
     pub layout_options: LayoutOptions,
     cache: Option<LayoutCache>,
+    accounting: RefCell<AccountingCache>,
 
     /// Mouse position in treemap-local pixels, for hit-testing and the tooltip.
     pub pointer: Option<Point<Pixels>>,
@@ -495,6 +505,7 @@ impl Disktree {
                 ..LayoutOptions::default()
             },
             cache: None,
+            accounting: RefCell::new(AccountingCache::default()),
             pointer: None,
             treemap_origin: Rc::new(Cell::new(Point::new(px(0.), px(0.)))),
             treemap_size: Rc::new(Cell::new(size(px(0.), px(0.)))),
@@ -1706,25 +1717,14 @@ impl Disktree {
         let path = target.path.clone();
         if self.marks.toggle(target) {
             self.space_baseline = self.space_baseline.or(self.space);
-            let inside: Vec<PathBuf> = self
-                .marks
-                .items()
-                .iter()
-                .filter(|item| {
-                    item.path != path && item.path.starts_with(&path)
-                })
-                .map(|item| item.path.clone())
-                .collect();
-            for inner in &inside {
-                self.marks.remove(inner);
-            }
-            if !inside.is_empty() {
+            let inside = self.marks.absorb(&path);
+            if inside > 0 {
                 self.notice = Some((
                     format!(
                         "{} now covers {} mark{} inside it",
                         display_path(&path, self.home.as_deref()),
-                        inside.len(),
-                        if inside.len() == 1 { "" } else { "s" }
+                        inside,
+                        if inside == 1 { "" } else { "s" }
                     ),
                     Status::Neutral,
                 ));
@@ -1735,12 +1735,7 @@ impl Disktree {
 
     /// The marked directory `path` is inside, if any; never `path` itself.
     pub fn marked_ancestor(&self, path: &Path) -> Option<PathBuf> {
-        self.marks
-            .items()
-            .iter()
-            .filter(|item| item.path != path && path.starts_with(&item.path))
-            .map(|item| item.path.clone())
-            .min_by_key(|ancestor| ancestor.as_os_str().len())
+        self.marks.ancestor(path).map(Path::to_path_buf)
     }
 
     pub fn target_at(&self, crumbs: &[usize]) -> Option<Target> {
@@ -1749,7 +1744,7 @@ impl Disktree {
         Some(Target {
             hidden: is_hidden(&path),
             path,
-            bytes: node.value(self.options.metric),
+            bytes: node.bytes,
             is_dir: node.is_dir(),
         })
     }
@@ -1767,7 +1762,60 @@ impl Disktree {
 
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
-        plan(self.marks.items(), &self.root_path)
+        #[cfg(test)]
+        crate::marks::work::PLANS.set(crate::marks::work::PLANS.get() + 1);
+        let mut plan = plan(self.marks.items(), &self.root_path);
+        if let Some(tree) = &self.tree {
+            let mut cached = self.accounting.borrow_mut();
+            if !cached.tree.ptr_eq(&Arc::downgrade(tree))
+                || cached.root != self.root_path
+            {
+                *cached = AccountingCache {
+                    tree: Arc::downgrade(tree),
+                    root: self.root_path.clone(),
+                    estimates: Vec::new(),
+                };
+            }
+            let mut resolver =
+                crate::marks::Resolver::new(&self.root_path, tree);
+            let mut next = Vec::new();
+            plan.estimate_selection(|targets| {
+                let paths: Vec<_> =
+                    targets.iter().map(|target| target.path.clone()).collect();
+                let value = cached
+                    .estimates
+                    .iter()
+                    .find(|(old, _)| *old == paths)
+                    .map_or_else(
+                        || {
+                            let nodes: Vec<_> = targets
+                                .iter()
+                                .filter_map(|target| {
+                                    resolver
+                                        .resolve(&target.path)
+                                        .map(|(_, node)| node)
+                                })
+                                .collect();
+                            if let [node] = nodes.as_slice() {
+                                node.sharing().estimate.unwrap_or(
+                                    disktree_core::sharing::Estimate {
+                                        lower: node.bytes,
+                                        upper: node.bytes,
+                                        partial: false,
+                                    },
+                                )
+                            } else {
+                                disktree_core::sharing::estimate(nodes)
+                            }
+                        },
+                        |(_, value)| *value,
+                    );
+                next.push((paths, value));
+                value
+            });
+            cached.estimates = next;
+        }
+        plan
     }
 
     // ── layout and hit-testing ──────────────────────────────────────────
@@ -1778,19 +1826,17 @@ impl Disktree {
     /// to draw, and the marked/hidden/selected state of every tile is decided
     /// here, where the tree and the marks are both at hand.
     pub fn prepare(&mut self) -> Mosaic {
+        #[cfg(test)]
+        crate::marks::work::FRAMES.set(crate::marks::work::FRAMES.get() + 1);
         let metric = self.options.metric;
         let view = self.view;
         let hovered = self.hovered.clone();
         let selected = self.selected.clone();
 
-        // Marks are paths; the mosaic thinks in crumbs. Resolve once per frame
-        // rather than building a path for every tile.
-        let mut marked: FxHashSet<Vec<usize>> = FxHashSet::default();
-        for item in self.marks.items() {
-            if let Some(crumbs) = self.crumbs_for_path(&item.path) {
-                marked.insert(crumbs);
-            }
-        }
+        let marked = self.tree.as_ref().map_or_else(
+            || Arc::new(FxHashSet::default()),
+            |tree| self.marks.crumbs(&self.root_path, tree, metric),
+        );
 
         let Some(tiles) = self.layout().map(<[Tile]>::to_vec) else {
             return Mosaic {
@@ -1806,6 +1852,8 @@ impl Disktree {
         let mut decorations = Vec::with_capacity(tiles.len());
         let mut labels = Vec::new();
         for tile in &tiles {
+            #[cfg(test)]
+            crate::marks::work::TILES.set(crate::marks::work::TILES.get() + 1);
             let crumbs = tile.crumbs();
             let node = match &tile.kind {
                 TileKind::Node { crumbs } => self.node_at(crumbs),
@@ -1913,10 +1961,11 @@ impl Disktree {
         let mut crumbs = Vec::new();
         for component in relative.components() {
             let name = component.as_os_str().to_string_lossy();
-            let index = node
-                .children
-                .iter()
-                .position(|child| child.name.as_ref() == name)?;
+            let index = node.children.iter().position(|child| {
+                #[cfg(test)]
+                crate::marks::work::step();
+                child.name.as_ref() == name
+            })?;
             crumbs.push(index);
             node = node.child(index)?;
         }
@@ -3187,6 +3236,8 @@ impl Render for Disktree {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> impl gpui_kit::IntoElement {
+        #[cfg(test)]
+        crate::marks::work::RENDERS.set(crate::marks::work::RENDERS.get() + 1);
         self.rem = window.rem_size().as_f32();
         self.tick_transition(window);
         // The titlebar names the directory on screen, however it got there:

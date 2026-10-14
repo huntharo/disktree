@@ -24,6 +24,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+#[cfg(test)]
+thread_local! {
+    static NESTING_WORK: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// One path the user asked to remove.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -82,6 +89,12 @@ pub struct Plan {
     reclaim: u64,
     /// Bytes the targets free on other volumes; see [`Self::foreign`].
     foreign: u64,
+    /// Attribution from the same mount-table read that judged the guards.
+    attribution: Vec<crate::space::Attribution>,
+    /// Clone estimates are separate from listed allocation and its volumes.
+    reclaimable_bytes: Option<u64>,
+    reclaim_estimate: Option<u64>,
+    possible_bytes: Option<u64>,
 }
 
 impl Plan {
@@ -97,7 +110,53 @@ impl Plan {
     /// disk mounted under the root can be marked — gives its space back
     /// there, so projecting it here would lend one disk another's bytes.
     pub const fn reclaim(&self) -> u64 {
-        self.reclaim
+        match self.reclaim_estimate {
+            Some(bytes) => bytes,
+            None => self.reclaim,
+        }
+    }
+
+    /// Estimated savings across all targets, independent of the volume meter.
+    pub fn reclaimable_bytes(&self) -> u64 {
+        self.reclaimable_bytes.unwrap_or_else(|| self.bytes())
+    }
+
+    pub fn possible_bytes(&self) -> u64 {
+        self.possible_bytes
+            .unwrap_or_else(|| self.reclaimable_bytes())
+    }
+
+    /// Evaluate the accepted set together, preserving the guard's volume
+    /// attribution. An external volume can never inflate this volume's meter.
+    pub fn estimate_selection(
+        &mut self,
+        mut estimate: impl FnMut(&[&Target]) -> crate::sharing::Estimate,
+    ) {
+        let all: Vec<_> = self.targets.iter().collect();
+        let total = if all.is_empty() {
+            crate::sharing::Estimate::default()
+        } else {
+            estimate(&all)
+        };
+        let scanned: Vec<_> = self
+            .targets
+            .iter()
+            .zip(&self.attribution)
+            .filter_map(|(target, attribution)| {
+                (*attribution == crate::space::Attribution::Scanned)
+                    .then_some(target)
+            })
+            .collect();
+        let local = if scanned.is_empty() {
+            crate::sharing::Estimate::default()
+        } else if scanned.len() == all.len() {
+            total
+        } else {
+            estimate(&scanned)
+        };
+        self.reclaimable_bytes = Some(total.lower);
+        self.possible_bytes = Some(total.upper);
+        self.reclaim_estimate = Some(local.lower);
     }
 
     /// Bytes the targets free on other volumes, which the meter leaves out.
@@ -136,7 +195,7 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
         root: root.clone(),
         ..Plan::default()
     };
-    let mut accepted: Vec<Target> = Vec::new();
+    let mut accepted: Vec<(PathBuf, Target)> = Vec::new();
 
     if targets.is_empty() {
         return plan;
@@ -159,37 +218,57 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
             });
             continue;
         }
-        accepted.push(Target {
-            path,
-            ..target.clone()
-        });
+        accepted.push((
+            guard_key(&path),
+            Target {
+                path,
+                ..target.clone()
+            },
+        ));
     }
 
-    // A path inside another target is removed with it. Keep the outer one and
-    // report the inner one so the review screen can explain the nesting.
-    accepted.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut outer: Vec<Target> = Vec::new();
-    for target in accepted {
-        if outer
-            .iter()
-            .any(|candidate| within(&target.path, &candidate.path))
-        {
+    // Descendants are contiguous only when sorted by the same keys the
+    // guards compare (including case and macOS Data-volume aliases). Once
+    // sorted, only the last retained outer path can cover the next one.
+    accepted.sort_by(|left, right| {
+        #[cfg(test)]
+        NESTING_WORK.set(NESTING_WORK.get() + 1);
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.path.cmp(&right.1.path))
+    });
+    let mut outer: Option<PathBuf> = None;
+    for (key, target) in accepted {
+        #[cfg(test)]
+        NESTING_WORK.set(NESTING_WORK.get() + 1);
+        if outer.as_ref().is_some_and(|parent| key.starts_with(parent)) {
             plan.covered.push(target);
         } else {
-            outer.push(target);
+            outer = Some(key);
+            plan.targets.push(target);
         }
     }
-    plan.targets = outer;
+    // Preserve the review list's original path ordering, independently of
+    // the guard-key ordering used to establish nesting.
+    for targets in [&mut plan.targets, &mut plan.covered] {
+        targets.sort_by(|left, right| {
+            #[cfg(test)]
+            NESTING_WORK.set(NESTING_WORK.get() + 1);
+            left.path.cmp(&right.path)
+        });
+    }
 
     // Which volume each target's bytes come back to. Only what comes back to
     // the scanned volume may be shown against its free space.
     for target in &plan.targets {
         let bytes = target.bytes;
-        match crate::space::attribution(
+        let attribution = crate::space::attribution(
             mounts.mounts.as_deref(),
             &plan.root,
             &target.path,
-        ) {
+        );
+        plan.attribution.push(attribution);
+        match attribution {
             crate::space::Attribution::Scanned => plan.reclaim += bytes,
             crate::space::Attribution::Other => plan.foreign += bytes,
             crate::space::Attribution::Unknown => {}
@@ -277,12 +356,6 @@ fn windows_key(path: &Path) -> PathBuf {
 #[cfg(not(windows))]
 fn windows_key(path: &Path) -> PathBuf {
     path.to_path_buf()
-}
-
-/// `path` is `base` or inside it, by whole components, as the guards
-/// compare them.
-fn within(path: &Path, base: &Path) -> bool {
-    guard_key(path).starts_with(guard_key(base))
 }
 
 /// The system trees with their guard keys, computed once: the review screen
@@ -1750,6 +1823,78 @@ mod tests {
     }
 
     #[test]
+    fn removal_nesting_budget() {
+        let temp = TempDir::new().expect("tempdir");
+        let measure = |count| {
+            let targets: Vec<_> = (0..count)
+                .map(|index| (index * 73) % count)
+                .map(|index| Target {
+                    path: temp.path().join(format!("item-{index:05}")),
+                    bytes: 1,
+                    is_dir: false,
+                    hidden: false,
+                })
+                .collect();
+            NESTING_WORK.set(0);
+            let start = std::time::Instant::now();
+            let plan =
+                plan_against(&targets, temp.path(), &MountTable::default());
+            let elapsed = start.elapsed();
+            let operations = NESTING_WORK.get();
+            assert_eq!(plan.targets.len(), count);
+            eprintln!("plan M={count} work={operations} wall={elapsed:?}");
+            operations
+        };
+        let small = measure(128);
+        let large = measure(1024);
+        assert!(large <= small * 16, "8x marks: {small} -> {large}");
+        assert!(large <= 1024 * 32, "absolute work cap: {large}");
+    }
+
+    #[test]
+    fn nesting_keeps_component_boundaries_duplicates_and_output_order() {
+        let temp = TempDir::new().expect("tempdir");
+        let targets: Vec<_> =
+            ["z", "ab", "a/deep", "a", "a", "ab/inner", "a/deeper/file"]
+                .map(|name| target(&temp.path().join(name), 1))
+                .into();
+        let result =
+            plan_against(&targets, temp.path(), &MountTable::default());
+        let paths = |targets: &[Target]| -> Vec<_> {
+            targets
+                .iter()
+                .map(|item| {
+                    item.path
+                        .strip_prefix(temp.path())
+                        .expect("under root")
+                        .to_path_buf()
+                })
+                .collect()
+        };
+        assert_eq!(paths(&result.targets), ["a", "ab", "z"].map(PathBuf::from));
+        assert_eq!(
+            paths(&result.covered),
+            ["a", "a/deep", "a/deeper/file", "ab/inner"].map(PathBuf::from)
+        );
+        assert!(result.blocked.is_empty());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn nesting_uses_guard_case_order_even_when_the_child_sorts_first() {
+        let temp = TempDir::new().expect("tempdir");
+        let parent = target(&temp.path().join("alpha"), 3);
+        let child = target(&temp.path().join("ALPHA/child"), 1);
+        let result = plan_against(
+            &[child.clone(), parent.clone()],
+            temp.path(),
+            &MountTable::default(),
+        );
+        assert_eq!(result.targets, [parent]);
+        assert_eq!(result.covered, [child]);
+    }
+
+    #[test]
     fn a_plan_keeps_only_the_outermost_targets() {
         let temp = tree();
         let root = temp.path();
@@ -1802,6 +1947,23 @@ mod tests {
         assert_eq!(plan.reclaim(), 100, "the Btrfs subvolume is this disk");
         assert_eq!(plan.foreign(), 600, "another disk, and a snapshot");
         assert_eq!(plan.unattributed(), 0);
+        let mut estimated = plan;
+        estimated.estimate_selection(|targets| {
+            let bytes = targets.iter().map(|target| target.bytes / 2).sum();
+            crate::sharing::Estimate {
+                lower: bytes,
+                upper: bytes,
+                partial: false,
+            }
+        });
+        assert_eq!(estimated.reclaimable_bytes(), 350);
+        assert_eq!(estimated.reclaim(), 50, "only this volume's estimate");
+        assert_eq!(estimated.foreign(), 600, "listed foreign allocation");
+        assert_eq!(
+            estimated.unattributed(),
+            0,
+            "sharing is not an unknown volume"
+        );
 
         // A mark inside another is removed with it, so its bytes are counted
         // once here as they are in the total.
@@ -1829,6 +1991,19 @@ mod tests {
         assert_eq!(plan.reclaim(), 0);
         assert_eq!(plan.foreign(), 0);
         assert_eq!(plan.unattributed(), 50, "no saving may be claimed");
+        let mut estimated = plan;
+        estimated.estimate_selection(|_| crate::sharing::Estimate {
+            lower: 25,
+            upper: 50,
+            partial: false,
+        });
+        assert_eq!(estimated.reclaimable_bytes(), 25);
+        assert_eq!(
+            estimated.reclaim(),
+            0,
+            "unplaced estimates stay off the meter"
+        );
+        assert_eq!(estimated.unattributed(), 50);
     }
 
     #[test]

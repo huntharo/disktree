@@ -1,0 +1,10 @@
+   Compiling disktree-core v0.11.0 (/Users/huntharo/.codex/worktrees/mujumhxf/disktree/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1.53s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-8aad222ba4e32dfe)
+
+running 1 test
+selected-set accounting operations 128->1024 groups: [1790, 14334]
+test sharing::reclaim::tests::selected_set_work_scales_with_members_even_when_groups_and_marks_grow ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 175 filtered out; finished in 0.19s
+

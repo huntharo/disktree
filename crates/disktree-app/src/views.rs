@@ -4,6 +4,8 @@
 //! always exactly what the state says — there is no second copy of anything to
 //! keep in sync.
 
+use std::path::Path;
+
 use disktree_core::classify::Category;
 use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::removal::{Plan, RemovalMode, Target};
@@ -24,6 +26,7 @@ use gpui_omarchy::{
 };
 
 use gpui_kit::prelude::FluentBuilder as _;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::palette;
 use crate::state::{
@@ -36,6 +39,54 @@ use crate::widgets;
 /// How many marks the review screen lists. Everything above the cap is still
 /// removed; the list only stops being exhaustive, which it says out loud.
 const LIST_LIMIT: usize = 1200;
+
+/// Row decoration borrows this render's freshly evaluated plan. It must
+/// not cache removal authorization, and each displayed row needs constant
+/// expected hash lookups rather than scans of all blocked/covered targets.
+#[derive(Debug)]
+struct ReviewStatus<'a> {
+    covered: FxHashSet<&'a Path>,
+    blocked: FxHashMap<&'a Path, &'a str>,
+}
+
+impl<'a> ReviewStatus<'a> {
+    fn new(plan: &'a Plan) -> Self {
+        let mut status = Self {
+            covered: FxHashSet::default(),
+            blocked: FxHashMap::default(),
+        };
+        for target in &plan.covered {
+            #[cfg(test)]
+            crate::marks::work::REVIEW
+                .set(crate::marks::work::REVIEW.get() + 1);
+            status.covered.insert(target.path.as_path());
+        }
+        for target in &plan.blocked {
+            #[cfg(test)]
+            crate::marks::work::REVIEW
+                .set(crate::marks::work::REVIEW.get() + 1);
+            // A raw queue may repeat a path. Keep the first explanation,
+            // matching the original linear find's behavior.
+            status
+                .blocked
+                .entry(target.path.as_path())
+                .or_insert(target.reason.as_str());
+        }
+        status
+    }
+
+    fn covered(&self, path: &Path) -> bool {
+        #[cfg(test)]
+        crate::marks::work::REVIEW.set(crate::marks::work::REVIEW.get() + 1);
+        self.covered.contains(path)
+    }
+
+    fn blocked(&self, path: &Path) -> Option<&str> {
+        #[cfg(test)]
+        crate::marks::work::REVIEW.set(crate::marks::work::REVIEW.get() + 1);
+        self.blocked.get(path).copied()
+    }
+}
 
 /// The whole window.
 pub fn root(
@@ -266,8 +317,8 @@ fn delete_dialog(
         targets => format!("Delete {} items permanently?", targets.len()),
     };
     let body = format!(
-        "This frees {}. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
-        human_bytes(plan.bytes())
+        "Estimated to free ≈ {}. Shared blocks and snapshots may retain space. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
+        savings(plan.reclaimable_bytes(), plan.possible_bytes())
     );
     let confirm = cx.entity().downgrade();
     let cancel = confirm.clone();
@@ -1228,6 +1279,19 @@ fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
             widgets::human_count(files),
             widgets::human_count(dirs)
         ))
+        .when(tree.is_some_and(|node| node.sharing().files > 0), |this| {
+            let sharing = tree.expect("checked above").sharing();
+            this.child(format!(
+                "· APFS clones: {} · ≈ {} counted again{}",
+                human_bytes(sharing.bytes),
+                human_bytes(sharing.duplicate_bytes),
+                if sharing.groups_truncated {
+                    " (partial)"
+                } else {
+                    ""
+                }
+            ))
+        })
         .when(errors > 0, |this| {
             this.child(div().text_color(theme.warning).child(format!(
                 "· {} unreadable",
@@ -1440,7 +1504,24 @@ fn selection_section(
             text::TITLE,
             cx,
         ))
-        .child(widgets::bar(share, highlight, cx));
+        .child(widgets::bar(share, highlight, cx))
+        .when(node.sharing().estimate.is_some(), |this| {
+            this.child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(format!(
+                        "Estimated space freed · ≈ {}",
+                        savings(
+                            node.sharing().reclaimable(node.bytes),
+                            node.sharing().possible(node.bytes)
+                        )
+                    )),
+            )
+            .when(node.sharing().unknown_files > 0, |this| {
+                this.child("Some clone private sizes are unavailable")
+            })
+        });
 
     let fourth = if node.is_dir()
         && let Some(path) = &path
@@ -2075,7 +2156,7 @@ fn disk_section(
                         ))
                         .text_color(highlight)
                         .child(format!(
-                            "→ {} free",
+                            "→ ≈ {} free",
                             human_bytes(after.available)
                         )),
                 )
@@ -2197,7 +2278,7 @@ fn review_button(
                 .overflow_hidden()
                 .text_ellipsis()
                 .child(format!(
-                    "Review {count} marked · frees {}…",
+                    "Review {count} marked · frees ≈ {}…",
                     human_bytes(reclaiming)
                 )),
         )
@@ -2519,9 +2600,8 @@ fn review(
 ) -> Div {
     let theme = cx.omarchy().clone();
     let plan = app.plan();
-    let items: Vec<Target> = app.marks.items().to_vec();
-    let covered: Vec<Target> = plan.covered.clone();
-    let blocked = plan.blocked.clone();
+    let items = app.marks.items();
+    let status = ReviewStatus::new(&plan);
 
     let mut list = div()
         .id("marked-list")
@@ -2544,12 +2624,19 @@ fn review(
     }
 
     for (index, item) in items.iter().take(LIST_LIMIT).enumerate() {
-        let is_covered =
-            covered.iter().any(|covered| covered.path == item.path);
-        let blocked_reason = blocked
-            .iter()
-            .find(|blocked| blocked.path == item.path)
-            .map(|blocked| blocked.reason.clone());
+        let is_covered = status.covered(&item.path);
+        let blocked_reason = status.blocked(&item.path).map(str::to_owned);
+        #[cfg(test)]
+        {
+            use crate::marks::work;
+            work::REVIEW_ROWS.set(work::REVIEW_ROWS.get() + 1);
+            work::COVERED_ROWS
+                .set(work::COVERED_ROWS.get() + usize::from(is_covered));
+            work::BLOCKED_ROWS.set(
+                work::BLOCKED_ROWS.get()
+                    + usize::from(blocked_reason.is_some()),
+            );
+        }
         list = list.child(mark_row(
             index,
             item,
@@ -2583,9 +2670,9 @@ fn review(
         .child(screen_header(
             "Review",
             &format!(
-                "{} marked \u{00b7} {} to free",
+                "{} marked \u{00b7} ≈ {} to free",
                 app.marks.len(),
-                human_bytes(plan.bytes())
+                savings(plan.reclaimable_bytes(), plan.possible_bytes())
             ),
             &theme,
             cx,
@@ -2800,13 +2887,22 @@ fn review_summary(
                     cx,
                 ))
                 .child(widgets::row(
-                    "Space freed",
-                    human_bytes(plan.bytes()),
+                    if app.removal_mode == RemovalMode::Trash {
+                        "After emptying trash (est.)"
+                    } else {
+                        "Estimated space freed"
+                    },
+                    savings(plan.reclaimable_bytes(), plan.possible_bytes()),
                     cx,
                 ))
                 .children(left_out),
         );
 
+    if cfg!(target_os = "macos") {
+        panel = panel.child(div().text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child("Complete clone groups count shared data once. Remaining hardlinks retain file data. Ranges show unmeasured sharing; snapshots and open files can retain space. Rescan to update estimates."));
+    }
     if let Some(volume) = app.space {
         panel = panel.child(
             div()
@@ -3630,4 +3726,74 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                         )),
                 ),
         )
+}
+
+/// Both ends are scan-derived; the meter uses the lower bound only.
+fn savings(lower: u64, upper: u64) -> String {
+    if lower == upper {
+        human_bytes(lower)
+    } else {
+        format!("{}–{}", human_bytes(lower), human_bytes(upper))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use disktree_core::removal::Blocked;
+    use std::path::PathBuf;
+
+    #[test]
+    fn review_status_preserves_exact_paths_and_first_blocked_reason() {
+        let path = PathBuf::from("/synthetic/a/child");
+        let mut plan = Plan::default();
+        plan.covered.push(Target {
+            path: path.clone(),
+            bytes: 1,
+            is_dir: false,
+            hidden: false,
+        });
+        plan.blocked.push(Blocked {
+            path: path.clone(),
+            reason: "first".into(),
+        });
+        plan.blocked.push(Blocked {
+            path: path.clone(),
+            reason: "second".into(),
+        });
+        let status = ReviewStatus::new(&plan);
+        assert!(status.covered(&path));
+        assert!(!status.covered(Path::new("/synthetic/a/childish")));
+        assert!(!status.covered(Path::new("/synthetic/A/child")));
+        assert_eq!(status.blocked(&path), Some("first"));
+        assert_eq!(
+            status.blocked(Path::new("/synthetic/a/./child")),
+            Some("first")
+        );
+        assert_eq!(status.blocked(Path::new("/synthetic/A/child")), None);
+        plan.blocked.clear();
+        plan.covered.clear();
+        let refreshed = ReviewStatus::new(&plan);
+        assert_eq!(refreshed.blocked(&path), None);
+        assert!(!refreshed.covered(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_status_keeps_non_utf8_paths_distinct() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = Path::new("/synthetic")
+            .join(std::ffi::OsStr::from_bytes(b"not-\xff"));
+        let mut plan = Plan::default();
+        plan.blocked.push(Blocked {
+            path: path.clone(),
+            reason: "blocked".into(),
+        });
+        let status = ReviewStatus::new(&plan);
+        assert_eq!(status.blocked(&path), Some("blocked"));
+        assert_eq!(
+            status.blocked(Path::new(&path.to_string_lossy().into_owned())),
+            None
+        );
+    }
 }
