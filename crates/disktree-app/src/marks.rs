@@ -18,6 +18,9 @@ pub mod work {
     thread_local! {
         pub static RESOLUTION: Cell<usize> = const { Cell::new(0) };
         pub static FRAMES: Cell<usize> = const { Cell::new(0) };
+        pub static RENDERS: Cell<usize> = const { Cell::new(0) };
+        pub static PLANS: Cell<usize> = const { Cell::new(0) };
+        pub static REFRESHES: Cell<usize> = const { Cell::new(0) };
         pub static TILES: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -28,6 +31,9 @@ pub mod work {
     pub fn reset() {
         RESOLUTION.set(0);
         FRAMES.set(0);
+        RENDERS.set(0);
+        PLANS.set(0);
+        REFRESHES.set(0);
         TILES.set(0);
     }
 }
@@ -98,6 +104,8 @@ impl Marks {
     /// Re-read sizes from a freshly scanned tree. Missing paths stay marked
     /// with zero bytes, so they cannot claim space that is already gone.
     pub fn refresh(&mut self, root_path: &Path, root: &Node, _metric: Metric) {
+        #[cfg(test)]
+        work::REFRESHES.set(work::REFRESHES.get() + 1);
         self.resolved = None;
         let mut resolver = Resolver::new(root_path, root);
         let mut resolved = Vec::with_capacity(self.items.len());

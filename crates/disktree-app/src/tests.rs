@@ -2097,3 +2097,129 @@ fn marked_tiles_follow_metric_rescan_and_mark_changes(cx: &mut TestAppContext) {
     draw(window);
     assert!(update(&view, window, |app, _| marked_paths(app)).is_empty());
 }
+
+/// Opt-in latency evidence, separate from deterministic CI work budgets.
+#[gpui_kit::test]
+#[ignore = "manual interaction timing on synthetic temporary files"]
+fn marked_interaction_timings(cx: &mut TestAppContext) {
+    use crate::marks::work;
+    use disktree_core::removal::Target;
+    use gpui_kit::Modifiers;
+
+    fn measure(
+        view: &Entity<Disktree>,
+        window: &mut Window,
+        action: &str,
+        repeat: usize,
+        run: impl FnOnce(&mut Window),
+    ) {
+        let before = read(view, window, |app| app.marks.len());
+        work::reset();
+        let start = std::time::Instant::now();
+        run(window);
+        let elapsed = start.elapsed();
+        let after = read(view, window, |app| app.marks.len());
+        assert!(work::RENDERS.get() > 0, "must render the real screen");
+        assert!(work::PLANS.get() > 0, "must include removal projections");
+        assert_eq!(work::REFRESHES.get(), 0, "interaction must not rescan");
+        eprintln!(
+            "interaction action={action} repeat={repeat} marks={before}->{after} renders={} prepares={} plans={} refreshes={} wall={elapsed:?}",
+            work::RENDERS.get(),
+            work::FRAMES.get(),
+            work::PLANS.get(),
+            work::REFRESHES.get(),
+        );
+    }
+
+    cx.update(gpui_omarchy::init);
+    let temp = tempfile::tempdir().expect("tempdir");
+    // One broad directory, kept fixed while only the number of marks grows.
+    // Each marked folder contains a file: descendants still make one mark.
+    for index in 0..1025 {
+        let folder = temp.path().join(format!("folder-{index:05}"));
+        std::fs::create_dir(&folder).expect("mkdir");
+        std::fs::write(folder.join("payload"), [b'x'; 64]).expect("write");
+    }
+    let tree = scan(temp.path(), options()).expect("scan private fixture");
+    let extra_path = temp.path().join("folder-01024");
+    for count in [0, 1, 8, 32, 128, 1024] {
+        let root_path = temp.path().to_path_buf();
+        let snapshot = tree.clone();
+        let (view, window) = cx.add_window_view(move |_, cx| {
+            Disktree::with_tree(root_path.clone(), snapshot, options(), 3, cx)
+        });
+        window.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+        let focus = read(&view, window, |app| app.focus.clone());
+        window.update(|window, cx| window.focus(&focus, cx));
+        update(&view, window, |app, cx| {
+            assert!(app.space.is_some() && app.show_selection);
+            for index in 0..count {
+                app.marks.toggle(Target {
+                    path: temp.path().join(format!("folder-{index:05}")),
+                    bytes: 64,
+                    is_dir: true,
+                    hidden: false,
+                });
+            }
+            cx.notify();
+        });
+        draw(window);
+        for repeat in 1..=3 {
+            update(&view, window, |app, cx| {
+                app.pointer_active = false;
+                app.hovered = None;
+                app.pointer = None;
+                let crumbs =
+                    app.crumbs_for_path(&extra_path).expect("extra folder");
+                app.select(Some(crumbs), cx);
+            });
+            draw(window);
+            measure(&view, window, "mark-space", repeat, |window| {
+                press(window, "space");
+            });
+            assert_eq!(read(&view, window, |app| app.marks.len()), count + 1);
+            let at = update(&view, window, |app, _| {
+                let tile = app
+                    .layout()
+                    .expect("layout")
+                    .iter()
+                    .find(|tile| {
+                        matches!(
+                            tile.kind,
+                            disktree_core::treemap::TileKind::Node { .. }
+                        )
+                    })
+                    .expect("node tile")
+                    .rect;
+                let rect = app.view.project(tile);
+                let origin = app.treemap_origin.get();
+                Point::new(
+                    origin.x + px(rect.x + rect.w / 2.),
+                    origin.y + px(rect.y + rect.h / 2.),
+                )
+            });
+            measure(&view, window, "hover", repeat, |window| {
+                window.simulate_mouse_move(at, None, Modifiers::none());
+                draw(window);
+            });
+            assert!(read(&view, window, |app| app.hovered.is_some()));
+            measure(&view, window, "review-c", repeat, |window| {
+                press(window, "c");
+            });
+            assert_eq!(read(&view, window, |app| app.screen), Screen::Review);
+            press(window, "escape");
+            update(&view, window, |app, cx| {
+                app.pointer_active = false;
+                app.hovered = None;
+                app.pointer = None;
+                let crumbs =
+                    app.crumbs_for_path(&extra_path).expect("extra folder");
+                app.select(Some(crumbs), cx);
+            });
+            draw(window);
+            press(window, "space");
+            assert_eq!(read(&view, window, |app| app.marks.len()), count);
+        }
+        window.update(|window, _| window.remove_window());
+    }
+}

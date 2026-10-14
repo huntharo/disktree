@@ -5,6 +5,22 @@ profile (application opt-level 1, dependency opt-level 2). All trees and paths
 are synthetic or inside private temporary directories. No home/volume scan,
 real Trash operation, APFS accounting change or parent-branch edit was used.
 
+## What the timing means
+
+A mark is one independently queued file or directory, not every file inside a
+marked directory. The 1,024-mark case is a large-queue stress test, not an
+established frequent manual workload. The 6.60-second result is **four forced
+draws/eight prepares of Explore with that queue already present**. It is not
+one scan or one click.
+
+[Individual-action measurements and call-path explanation](interactions.md)
+now cover 0, 1, 8, 32, 128 and 1,024 queued paths on a fixed real temporary
+tree, using Space, pointer movement and Review inputs. Main already completes
+those inputs in a few milliseconds with a handful of marks; the demonstrated
+large improvement applies to large queues. At 1,024 queued folders, adding
+one more or hovering takes about 1.1 seconds on main in that fixture. These
+costs can recur on renders while interacting, rather than once per scan.
+
 ## Red before green
 
 Base: `6c8d4ce6211bf135ff4e42890faebff1040e1846` (upstream/main and fork main).
@@ -157,7 +173,9 @@ callers have no revision-counter or manual invalidation obligation.
 
 - `cargo xtask lint`: pass; [lint.log](lint.log).
 - `cargo xtask test`: 78 app, 150 core and 3 xtask tests pass;
-  [tests.log](tests.log). Two pre-existing ignored core tests remain ignored.
+  [tests.log](tests.log). Two pre-existing ignored core tests remain ignored. The new opt-in
+  interaction timing test is also ignored by the normal suite; it passes
+  when explicitly run on both main and fixed snapshots.
 - `cargo test --workspace budget -- --nocapture`: all budgets pass.
 - Three serial red repetitions fail the intended budgets (exit 101), followed
   by three serial green repetitions passing them (exit 0).

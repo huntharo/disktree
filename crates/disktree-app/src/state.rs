@@ -1778,6 +1778,8 @@ impl Disktree {
 
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
+        #[cfg(test)]
+        crate::marks::work::PLANS.set(crate::marks::work::PLANS.get() + 1);
         let mut plan = plan(self.marks.items(), &self.root_path);
         if let Some(tree) = &self.tree {
             let mut cached = self.accounting.borrow_mut();
@@ -3250,6 +3252,8 @@ impl Render for Disktree {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> impl gpui_kit::IntoElement {
+        #[cfg(test)]
+        crate::marks::work::RENDERS.set(crate::marks::work::RENDERS.get() + 1);
         self.rem = window.rem_size().as_f32();
         self.tick_transition(window);
         // The titlebar names the directory on screen, however it got there:
