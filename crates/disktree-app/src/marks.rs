@@ -22,6 +22,12 @@ pub mod work {
         pub static PLANS: Cell<usize> = const { Cell::new(0) };
         pub static REFRESHES: Cell<usize> = const { Cell::new(0) };
         pub static TILES: Cell<usize> = const { Cell::new(0) };
+        pub static MARKING: Cell<usize> = const { Cell::new(0) };
+        pub static COMPACTION: Cell<usize> = const { Cell::new(0) };
+        pub static REVIEW: Cell<usize> = const { Cell::new(0) };
+        pub static REVIEW_ROWS: Cell<usize> = const { Cell::new(0) };
+        pub static COVERED_ROWS: Cell<usize> = const { Cell::new(0) };
+        pub static BLOCKED_ROWS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub fn step() {
@@ -35,6 +41,12 @@ pub mod work {
         PLANS.set(0);
         REFRESHES.set(0);
         TILES.set(0);
+        MARKING.set(0);
+        COMPACTION.set(0);
+        REVIEW.set(0);
+        REVIEW_ROWS.set(0);
+        COVERED_ROWS.set(0);
+        BLOCKED_ROWS.set(0);
     }
 }
 
@@ -91,7 +103,11 @@ impl Marks {
     pub fn remove(&mut self, path: &Path) {
         if self.index.remove(path) {
             self.resolved = None;
-            self.items.retain(|item| item.path != path);
+            self.items.retain(|item| {
+                #[cfg(test)]
+                work::COMPACTION.set(work::COMPACTION.get() + 1);
+                item.path != path
+            });
         }
     }
 

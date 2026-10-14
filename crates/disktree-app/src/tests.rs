@@ -2223,3 +2223,206 @@ fn marked_interaction_timings(cx: &mut TestAppContext) {
         window.update(|window, _| window.remove_window());
     }
 }
+
+/// The disk root is private and empty; only the displayed tree is synthetic.
+fn queue_budget_view(
+    count: usize,
+    cx: &mut TestAppContext,
+) -> (tempfile::TempDir, Entity<Disktree>, &mut Window) {
+    use disktree_core::tree::{Metric, Node, NodeKind, aggregate};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_path = temp.path().to_path_buf();
+    let mut tree = Node::directory("root");
+    let mut parent = Node::directory("container");
+    for index in 0..count {
+        parent.children.push(Node::entry(
+            format!("file-{index:05}"),
+            NodeKind::File,
+            1,
+        ));
+    }
+    tree.children.push(parent);
+    tree.children.push(Node::entry("keep", NodeKind::File, 1));
+    aggregate(&mut tree, Metric::Bytes);
+    let (view, window) = cx.add_window_view(move |_, cx| {
+        Disktree::with_tree(root_path.clone(), tree, options(), 3, cx)
+    });
+    (temp, view, window)
+}
+
+#[gpui_kit::test]
+fn queue_construction_budget(cx: &mut TestAppContext) {
+    use crate::marks::work;
+
+    cx.update(gpui_omarchy::init);
+    let mut measure = |count| {
+        let (_temp, view, window) = queue_budget_view(count, cx);
+        let operations = update(&view, window, |app, cx| {
+            work::reset();
+            let start = std::time::Instant::now();
+            for index in 0..count {
+                app.toggle_mark(&[0, index], cx);
+            }
+            assert_eq!(app.marks.len(), count);
+            assert_eq!(
+                work::FRAMES.get(),
+                0,
+                "measure insertion before rendering"
+            );
+            let operations = work::MARKING.get() + work::COMPACTION.get();
+            assert!(operations > 0);
+            eprintln!(
+                "queue-construction M={count} work={operations} wall={:?}",
+                start.elapsed()
+            );
+            operations
+        });
+        window.update(|window, _| window.remove_window());
+        operations
+    };
+    let small = measure(128);
+    let large = measure(1024);
+    assert!(large <= small * 16, "8x marks: {small} -> {large}");
+    assert!(large <= 1024 * 32, "absolute insertion budget: {large}");
+}
+
+#[gpui_kit::test]
+fn parent_absorption_budget(cx: &mut TestAppContext) {
+    use crate::marks::work;
+
+    cx.update(gpui_omarchy::init);
+    let mut measure = |count| {
+        let (temp, view, window) = queue_budget_view(count, cx);
+        let operations = update(&view, window, |app, cx| {
+            let keep = app.target_at(&[1]).expect("neighbour");
+            app.marks.toggle(keep.clone());
+            for index in 0..count {
+                let target = app.target_at(&[0, index]).expect("file");
+                app.marks.toggle(target);
+            }
+            work::reset();
+            let start = std::time::Instant::now();
+            app.toggle_mark(&[0], cx);
+            assert_eq!(app.marks.len(), 2);
+            assert_eq!(app.marks.items()[0], keep, "neighbour stays in order");
+            assert_eq!(
+                app.marks.items()[1].path,
+                temp.path().join("container")
+            );
+            assert_eq!(app.marks.items()[1].bytes, count as u64);
+            let operations = work::MARKING.get() + work::COMPACTION.get();
+            assert!(operations > 0);
+            eprintln!(
+                "parent-absorption M={count} work={operations} compactions={} wall={:?}",
+                work::COMPACTION.get(),
+                start.elapsed()
+            );
+            operations
+        });
+        window.update(|window, _| window.remove_window());
+        operations
+    };
+    let small = measure(128);
+    let large = measure(1024);
+    assert!(large <= small * 16, "8x descendants: {small} -> {large}");
+    assert!(large <= 1024 * 32, "absolute absorption budget: {large}");
+}
+
+fn review_status_work(
+    count: usize,
+    covered: bool,
+    cx: &mut TestAppContext,
+) -> (usize, usize) {
+    use crate::marks::work;
+    use disktree_core::removal::Target;
+
+    let (temp, view, window) = queue_budget_view(count, cx);
+    update(&view, window, |app, _| {
+        if covered {
+            let parent = app.target_at(&[0]).expect("parent");
+            app.marks.toggle(parent);
+        }
+        for index in 0..count {
+            let target = if covered {
+                app.target_at(&[0, index]).expect("file")
+            } else {
+                Target {
+                    path: temp
+                        .path()
+                        .with_extension("outside")
+                        .join(format!("file-{index:05}")),
+                    bytes: 1,
+                    is_dir: false,
+                    hidden: false,
+                }
+            };
+            app.marks.toggle(target);
+        }
+        app.screen = Screen::Review;
+    });
+    work::reset();
+    let start = std::time::Instant::now();
+    for _ in 0..4 {
+        update(&view, window, |_, cx| cx.notify());
+        draw(window);
+    }
+    let elapsed = start.elapsed();
+    let frames = work::RENDERS.get();
+    let operations = work::REVIEW.get();
+    assert!(
+        frames >= 4 && work::PLANS.get() >= 4,
+        "must render and plan Review"
+    );
+    let rows = (count + usize::from(covered)).min(1200);
+    assert_eq!(
+        work::REVIEW_ROWS.get(),
+        rows * frames,
+        "retain the display cap"
+    );
+    assert_eq!(
+        work::BLOCKED_ROWS.get(),
+        if covered { 0 } else { rows * frames }
+    );
+    assert_eq!(
+        work::COVERED_ROWS.get(),
+        if covered { (rows - 1) * frames } else { 0 }
+    );
+    assert!(operations > 0);
+    eprintln!(
+        "review-status covered={covered} M={count} work={operations} renders={frames} rows={rows} per-render={} wall={elapsed:?}",
+        operations / frames
+    );
+    window.update(|window, _| window.remove_window());
+    (operations, frames)
+}
+
+fn review_status_budget(cx: &mut TestAppContext, covered: bool) {
+    let (small, small_frames) = review_status_work(128, covered, cx);
+    let (large, large_frames) = review_status_work(1024, covered, cx);
+    assert!(
+        large * small_frames <= small * large_frames * 16,
+        "8x status rows: {small}/{small_frames} -> {large}/{large_frames}"
+    );
+    assert!(
+        large <= 1024 * large_frames * 8,
+        "absolute row-status budget: {large}"
+    );
+    let (capped, capped_frames) = review_status_work(8192, covered, cx);
+    assert!(
+        capped <= 8192 * capped_frames * 8,
+        "status budget above row cap: {capped}"
+    );
+}
+
+#[gpui_kit::test]
+fn blocked_review_status_budget(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    review_status_budget(cx, false);
+}
+
+#[gpui_kit::test]
+fn covered_review_status_budget(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    review_status_budget(cx, true);
+}

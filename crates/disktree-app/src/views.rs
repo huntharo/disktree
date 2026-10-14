@@ -2574,12 +2574,32 @@ fn review(
     }
 
     for (index, item) in items.iter().take(LIST_LIMIT).enumerate() {
-        let is_covered =
-            covered.iter().any(|covered| covered.path == item.path);
+        let is_covered = covered.iter().any(|covered| {
+            #[cfg(test)]
+            crate::marks::work::REVIEW
+                .set(crate::marks::work::REVIEW.get() + 1);
+            covered.path == item.path
+        });
         let blocked_reason = blocked
             .iter()
-            .find(|blocked| blocked.path == item.path)
+            .find(|blocked| {
+                #[cfg(test)]
+                crate::marks::work::REVIEW
+                    .set(crate::marks::work::REVIEW.get() + 1);
+                blocked.path == item.path
+            })
             .map(|blocked| blocked.reason.clone());
+        #[cfg(test)]
+        {
+            use crate::marks::work;
+            work::REVIEW_ROWS.set(work::REVIEW_ROWS.get() + 1);
+            work::COVERED_ROWS
+                .set(work::COVERED_ROWS.get() + usize::from(is_covered));
+            work::BLOCKED_ROWS.set(
+                work::BLOCKED_ROWS.get()
+                    + usize::from(blocked_reason.is_some()),
+            );
+        }
         list = list.child(mark_row(
             index,
             item,

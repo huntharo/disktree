@@ -1722,6 +1722,9 @@ impl Disktree {
                 .items()
                 .iter()
                 .filter(|item| {
+                    #[cfg(test)]
+                    crate::marks::work::MARKING
+                        .set(crate::marks::work::MARKING.get() + 1);
                     item.path != path && item.path.starts_with(&path)
                 })
                 .map(|item| item.path.clone())
@@ -1749,7 +1752,12 @@ impl Disktree {
         self.marks
             .items()
             .iter()
-            .filter(|item| item.path != path && path.starts_with(&item.path))
+            .filter(|item| {
+                #[cfg(test)]
+                crate::marks::work::MARKING
+                    .set(crate::marks::work::MARKING.get() + 1);
+                item.path != path && path.starts_with(&item.path)
+            })
             .map(|item| item.path.clone())
             .min_by_key(|ancestor| ancestor.as_os_str().len())
     }
