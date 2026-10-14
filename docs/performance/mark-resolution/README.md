@@ -1,4 +1,21 @@
-# Mark resolution and removal-plan performance
+# Large removal-queue performance
+
+The final combined scope and current validation are documented in
+[expanded evidence](expanded/README.md): the original path-resolution and
+removal-plan fixes plus efficient queue construction, one-pass parent
+absorption and indexed Review status. The expanded regular budgets fail
+before those additions and pass afterward, including 8,192-entry Review
+queues. Current validation: 241 enabled tests and the required lint gate pass.
+
+A mark is one queued file or folder, regardless of how many files a marked
+folder contains. The original 6.60-second stress result was four forced draws
+and eight prepares of Explore; it was not one scan or one click. The expanded
+report separates whole-queue construction, one parent action, four Review
+draws and individual UI inputs, and includes fresh combined-head timings.
+
+The sections below preserve the original three fixes' measurements and
+reproduction history. They are historical stage results; the expanded report
+is the source for the final combined implementation and validation.
 
 Measured on 2026-10-14, Darwin arm64, Rust 1.97.1, repository development/test
 profile (application opt-level 1, dependency opt-level 2). All trees and paths
@@ -24,10 +41,10 @@ costs can recur on renders while interacting, rather than once per scan.
 ## Broader follow-up audit
 
 [Additional rendering/scanning findings](additional-audit.md) document
-remaining queue-construction, parent-absorption, Review status-join, depth and
-mount-topology cases, plus a case-sensitive classification edge case. These
-are separately scoped follow-ups; PR #9's three original fixes do not remove
-them. Reproducible test-only probes and raw counts are included.
+the audit that identified queue construction, parent absorption and Review
+status joins, now addressed in the expansion. Depth, mount-topology and the
+case-sensitive classification edge case remain separate follow-ups.
+Historical test-only probes and raw counts are included.
 
 ## Red before green
 
@@ -177,7 +194,7 @@ removed when its production caller moved to this API. Display callers use
 `Marks::crumbs(&Path, &Arc<Node>, Metric) -> Arc<FxHashSet<Vec<usize>>>`;
 callers have no revision-counter or manual invalidation obligation.
 
-## Verification and reproduction
+## Original-stage verification and reproduction
 
 - `cargo xtask lint`: pass; [lint.log](lint.log).
 - `cargo xtask test`: 78 app, 150 core and 3 xtask tests pass;

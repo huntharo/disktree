@@ -1,5 +1,11 @@
 # Additional rendering and scanning complexity audit
 
+**Historical audit:** queue construction, parent absorption and Review status
+joins below are now fixed by the [expanded PR #9](expanded/README.md). The
+remaining depth, mount-topology and classification findings stay outside
+that queue-focused scope. Counts in this file describe the audited snapshot,
+not the final combined implementation.
+
 Audited on 2026-10-14 at `ab11b1fd884e950faa9902c0b3e0e870eb6815d9`:
 main `6c8d4ce` plus PR #9's fixes. APFS feature code is outside this audit.
 The cases below remain after the original three fixes. This follow-up records

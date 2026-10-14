@@ -1,5 +1,9 @@
 # What is a mark, and when does the delay happen?
 
+This file preserves the first set of input measurements at the original
+PR #9 fix. For the final combined scope, current validation and freshly
+replayed main-versus-final inputs, see [expanded evidence](expanded/README.md).
+
 A **mark** is one file or directory queued for removal. Marking a directory
 marks that path once, regardless of how many files it contains. For example,
 marking a cache directory containing a million files is M=1, not M=1,000,000.
