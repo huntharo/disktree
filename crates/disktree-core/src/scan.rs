@@ -600,7 +600,7 @@ fn link_count(meta: &Metadata) -> u64 {
 }
 
 #[cfg(not(unix))]
-fn link_count(_meta: &Metadata) -> u64 {
+const fn link_count(_meta: &Metadata) -> u64 {
     1
 }
 
