@@ -47,6 +47,14 @@ The main-only red/green proof is separate in
 [PR #9](https://github.com/huntharo/disktree/pull/9) and
 [mark-resolution](../mark-resolution/README.md). This branch incorporates
 that fix and reuses one lazy sibling resolver per accounting cache miss.
+One mark is one queued path, independent of its descendant count. The
+1,024-mark case is a stress workload, with no usage telemetry establishing
+that it is common. The earlier 6.60 s measured four forced Explore draws
+and eight prepares, not a scan or one click.
+[Individual interaction evidence](../mark-resolution/interactions.md)
+separates Space, hover and Review, includes smaller queues, and records
+render/plan counts with zero scan refreshes. Its timings compare the
+isolated main-only snapshots, not this APFS feature branch.
 Removal authorization remains fresh on every plan and in the worker.
 
 Selected subtrees merge bounded maps small to large: expected
@@ -101,5 +109,7 @@ cargo run --release -p disktree-core --example scan_accounting -- PATH
 ```
 
 Local validation: lint passed; 79 window/app, 174 core and 3 xtask tests passed;
-two existing core tests remained ignored. No private file contents were
+two existing core tests and the opt-in interaction timing test remained
+ignored in the normal suite. The interaction timing test was also run
+explicitly and passed on the combined branch. No private file contents were
 inspected and no user files were removed by this investigation.
