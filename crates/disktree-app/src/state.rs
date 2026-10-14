@@ -1785,6 +1785,8 @@ impl Disktree {
     /// to draw, and the marked/hidden/selected state of every tile is decided
     /// here, where the tree and the marks are both at hand.
     pub fn prepare(&mut self) -> Mosaic {
+        #[cfg(test)]
+        crate::marks::work::FRAMES.set(crate::marks::work::FRAMES.get() + 1);
         let metric = self.options.metric;
         let view = self.view;
         let hovered = self.hovered.clone();
@@ -1794,6 +1796,8 @@ impl Disktree {
         // rather than building a path for every tile.
         let mut marked: FxHashSet<Vec<usize>> = FxHashSet::default();
         for item in self.marks.items() {
+            #[cfg(test)]
+            crate::marks::work::step();
             if let Some(crumbs) = self.crumbs_for_path(&item.path) {
                 marked.insert(crumbs);
             }
@@ -1920,10 +1924,11 @@ impl Disktree {
         let mut crumbs = Vec::new();
         for component in relative.components() {
             let name = component.as_os_str().to_string_lossy();
-            let index = node
-                .children
-                .iter()
-                .position(|child| child.name.as_ref() == name)?;
+            let index = node.children.iter().position(|child| {
+                #[cfg(test)]
+                crate::marks::work::step();
+                child.name.as_ref() == name
+            })?;
             crumbs.push(index);
             node = node.child(index)?;
         }

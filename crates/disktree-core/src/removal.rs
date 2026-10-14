@@ -24,6 +24,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+#[cfg(test)]
+thread_local! {
+    static NESTING_WORK: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// One path the user asked to remove.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -200,13 +207,18 @@ fn plan_against(targets: &[Target], root: &Path, mounts: &MountTable) -> Plan {
 
     // A path inside another target is removed with it. Keep the outer one and
     // report the inner one so the review screen can explain the nesting.
-    accepted.sort_by(|left, right| left.path.cmp(&right.path));
+    accepted.sort_by(|left, right| {
+        #[cfg(test)]
+        NESTING_WORK.set(NESTING_WORK.get() + 1);
+        left.path.cmp(&right.path)
+    });
     let mut outer: Vec<Target> = Vec::new();
     for target in accepted {
-        if outer
-            .iter()
-            .any(|candidate| within(&target.path, &candidate.path))
-        {
+        if outer.iter().any(|candidate| {
+            #[cfg(test)]
+            NESTING_WORK.set(NESTING_WORK.get() + 1);
+            within(&target.path, &candidate.path)
+        }) {
             plan.covered.push(target);
         } else {
             outer.push(target);
@@ -1782,6 +1794,35 @@ mod tests {
                 .iter()
                 .any(|child| &*child.name == "nested" && child.files == 1)
         );
+    }
+
+    #[test]
+    fn removal_nesting_budget() {
+        let temp = TempDir::new().expect("tempdir");
+        let measure = |count| {
+            let targets: Vec<_> = (0..count)
+                .map(|index| (index * 73) % count)
+                .map(|index| Target {
+                    path: temp.path().join(format!("item-{index:05}")),
+                    bytes: 1,
+                    is_dir: false,
+                    hidden: false,
+                })
+                .collect();
+            NESTING_WORK.set(0);
+            let start = std::time::Instant::now();
+            let plan =
+                plan_against(&targets, temp.path(), &MountTable::default());
+            let elapsed = start.elapsed();
+            let operations = NESTING_WORK.get();
+            assert_eq!(plan.targets.len(), count);
+            eprintln!("plan M={count} work={operations} wall={elapsed:?}");
+            operations
+        };
+        let small = measure(128);
+        let large = measure(1024);
+        assert!(large <= small * 16, "8x marks: {small} -> {large}");
+        assert!(large <= 1024 * 32, "absolute work cap: {large}");
     }
 
     #[test]

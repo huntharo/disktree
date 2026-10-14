@@ -10,6 +10,25 @@ use disktree_core::removal::Target;
 use disktree_core::tree::{Metric, Node};
 use rustc_hash::FxHashSet;
 
+#[cfg(test)]
+pub(crate) mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static RESOLUTION: Cell<usize> = const { Cell::new(0) };
+        pub static FRAMES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn step() {
+        RESOLUTION.set(RESOLUTION.get() + 1);
+    }
+
+    pub fn reset() {
+        RESOLUTION.set(0);
+        FRAMES.set(0);
+    }
+}
+
 /// Marked paths, in the order they were marked.
 #[derive(Debug, Default)]
 pub struct Marks {
@@ -64,6 +83,8 @@ impl Marks {
     pub fn refresh(&mut self, root_path: &Path, root: &Node, metric: Metric) {
         let mut resolved = Vec::with_capacity(self.items.len());
         for item in &self.items {
+            #[cfg(test)]
+            work::step();
             match find(root_path, root, &item.path) {
                 Some(node) => resolved.push(Target {
                     bytes: node.value(metric),
@@ -92,10 +113,11 @@ pub fn find<'a>(
     let mut node = root;
     for component in relative.components() {
         let name = component.as_os_str().to_string_lossy();
-        node = node
-            .children
-            .iter()
-            .find(|child| child.name.as_ref() == name)?;
+        node = node.children.iter().find(|child| {
+            #[cfg(test)]
+            work::step();
+            child.name.as_ref() == name
+        })?;
     }
     Some(node)
 }
@@ -147,6 +169,44 @@ mod tests {
             is_dir: false,
             hidden: false,
         }
+    }
+
+    #[test]
+    fn refresh_resolution_budget() {
+        let measure = |count| {
+            let root_path = std::env::temp_dir().join("marks-budget");
+            let mut root = Node::directory("root");
+            let mut marks = Marks::default();
+            for index in 0..count {
+                let name = format!("folder-{index:05}");
+                let mut dir = Node::directory(name.as_str());
+                dir.children.push(file("payload", 1));
+                root.children.push(dir);
+                marks.toggle(Target {
+                    path: root_path.join(name).join("payload"),
+                    bytes: 0,
+                    is_dir: false,
+                    hidden: false,
+                });
+            }
+            work::reset();
+            let start = std::time::Instant::now();
+            for _ in 0..4 {
+                marks.refresh(&root_path, &root, Metric::Bytes);
+            }
+            let elapsed = start.elapsed();
+            let operations = work::RESOLUTION.get();
+            assert!(marks.items().iter().all(|item| item.bytes == 1));
+            eprintln!(
+                "refresh M={count} N={} R=4 work={operations} wall={elapsed:?}",
+                count * 2
+            );
+            operations
+        };
+        let small = measure(128);
+        let large = measure(1024);
+        assert!(large <= small * 16, "8x marks/folders: {small} -> {large}");
+        assert!(large <= 1024 * 4 * 16, "absolute work cap: {large}");
     }
 
     #[test]

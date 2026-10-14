@@ -1915,3 +1915,69 @@ fn the_power_menu_offers_only_what_the_cpus_can_tell_apart(
     draw(cx);
     assert!(read(&view, cx, |app| app.power_menu.is_none()));
 }
+
+/// Exercise prepare through actual window draws, including repeated renders.
+#[gpui_kit::test]
+fn marked_window_resolution_budget(cx: &mut TestAppContext) {
+    use crate::marks::work;
+    use disktree_core::removal::Target;
+    use disktree_core::tree::{Metric, Node, NodeKind, aggregate};
+
+    cx.update(gpui_omarchy::init);
+    let mut measure = |count| {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root_path = temp.path().to_path_buf();
+        let mut tree = Node::directory("root");
+        for index in 0..count {
+            let mut folder = Node::directory(format!("folder-{index:05}"));
+            folder
+                .children
+                .push(Node::entry("payload", NodeKind::File, 1));
+            tree.children.push(folder);
+        }
+        aggregate(&mut tree, Metric::Bytes);
+        let (view, window) = cx.add_window_view(move |_, cx| {
+            Disktree::with_tree(root_path.clone(), tree, options(), 3, cx)
+        });
+        update(&view, window, |app, _| {
+            for index in 0..count {
+                app.marks.toggle(Target {
+                    path: temp
+                        .path()
+                        .join(format!("folder-{index:05}"))
+                        .join("payload"),
+                    bytes: 1,
+                    is_dir: false,
+                    hidden: false,
+                });
+            }
+        });
+        work::reset();
+        let start = std::time::Instant::now();
+        for _ in 0..4 {
+            update(&view, window, |_, cx| cx.notify());
+            draw(window);
+        }
+        let elapsed = start.elapsed();
+        let frames = work::FRAMES.get();
+        let operations = work::RESOLUTION.get();
+        window.update(|window, _| window.remove_window());
+        assert!(frames >= 4, "budget must cover actual renders: {frames}");
+        assert!(operations > 0, "resolution instrumentation must run");
+        eprintln!(
+            "window M={count} N={} draws=4 prepares={frames} work={operations} wall={elapsed:?}",
+            count * 2
+        );
+        (operations, frames)
+    };
+    let (small, small_frames) = measure(128);
+    let (large, large_frames) = measure(1024);
+    assert!(
+        large * small_frames <= small * large_frames * 16,
+        "8x marks/folders per frame: {small}/{small_frames} -> {large}/{large_frames}"
+    );
+    assert!(
+        large <= 1024 * large_frames * 16,
+        "absolute work cap: {large}"
+    );
+}
