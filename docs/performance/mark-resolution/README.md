@@ -21,6 +21,14 @@ large improvement applies to large queues. At 1,024 queued folders, adding
 one more or hovering takes about 1.1 seconds on main in that fixture. These
 costs can recur on renders while interacting, rather than once per scan.
 
+## Broader follow-up audit
+
+[Additional rendering/scanning findings](additional-audit.md) document
+remaining queue-construction, parent-absorption, Review status-join, depth and
+mount-topology cases, plus a case-sensitive classification edge case. These
+are separately scoped follow-ups; PR #9's three original fixes do not remove
+them. Reproducible test-only probes and raw counts are included.
+
 ## Red before green
 
 Base: `6c8d4ce6211bf135ff4e42890faebff1040e1846` (upstream/main and fork main).
