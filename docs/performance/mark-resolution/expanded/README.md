@@ -61,6 +61,11 @@ that exactly 1,200 rows are built per render.
 | Blocked Review status, per render | 8,256 / 524,800 | 384 / 3,072 |
 | Covered Review status, per render | 8,384 / 525,824 | 386 / 3,074 |
 
+The blocked fixture queues paths outside the scanned root. The covered
+fixture supplies a raw overlapping parent/children queue; normal manual
+marking would absorb those overlaps. Both exercise status decoration through
+planning and rendering only, with no removal attempt.
+
 At 8,192 items, both Review cases use 10,592 status units per render, while
 keeping the 1,200-row cap. See [green.log](green.log). The tests drive
 `Disktree::toggle_mark` or actual GPUI window draws, not an isolated index
