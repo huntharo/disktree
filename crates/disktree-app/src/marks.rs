@@ -78,9 +78,9 @@ impl Marks {
         self.index.contains(path)
     }
 
-    /// Outermost marked ancestor, excluding the path itself. Keep the
-    /// spelling stored with the mark, using the same Path semantics as
-    /// exact membership and the old `starts_with` scan.
+    /// Marked ancestor with the shortest stored spelling, excluding the
+    /// path itself: the outermost one for paths built by the scan. Preserve
+    /// that choice even for raw queues with redundant path separators.
     pub fn ancestor(&self, path: &Path) -> Option<&Path> {
         path.ancestors()
             .skip(1)
@@ -89,7 +89,7 @@ impl Marks {
                 work::MARKING.set(work::MARKING.get() + 1);
                 self.index.get(ancestor)
             })
-            .last()
+            .min_by_key(|ancestor| ancestor.as_os_str().len())
             .map(PathBuf::as_path)
     }
 
@@ -533,6 +533,15 @@ mod tests {
         );
         marks.clear();
         assert_eq!(marks.absorb(Path::new("/synthetic")), 0);
+
+        // Raw control clients can supply redundant separators. Retain the
+        // original shortest-spelling rule rather than changing notices.
+        marks.toggle(target("/synthetic/a////////////////////", 1));
+        marks.toggle(target("/synthetic/a/child", 1));
+        assert_eq!(
+            marks.ancestor(Path::new("/synthetic/a/child/file")),
+            Some(Path::new("/synthetic/a/child"))
+        );
     }
 
     #[test]
