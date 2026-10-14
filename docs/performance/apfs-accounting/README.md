@@ -55,6 +55,15 @@ and eight prepares, not a scan or one click.
 separates Space, hover and Review, includes smaller queues, and records
 render/plan counts with zero scan refreshes. Its timings compare the
 isolated main-only snapshots, not this APFS feature branch.
+The [expanded queue fixes](../mark-resolution/expanded/README.md) are also
+integrated: an ordered mark index replaces repeated ancestor/descendant scans,
+parent absorption compacts once, and Review builds status indexes from each
+fresh plan. Disjoint construction is O(M D log M), absorption is
+O(M + K log M) plus ancestor lookup, and row-status work is expected
+O(B + C + L), with L <= 1,200. Exact membership now costs O(log M).
+The saved main-only audit remains historical; its depth, mount and unusual
+classification cases remain deferred.
+
 Removal authorization remains fresh on every plan and in the worker.
 
 Selected subtrees merge bounded maps small to large: expected
@@ -108,8 +117,11 @@ cargo test -p disktree-core macos::clone_tests -- --nocapture
 cargo run --release -p disktree-core --example scan_accounting -- PATH
 ```
 
-Local validation: lint passed; 79 window/app, 174 core and 3 xtask tests passed;
+Local validation: lint passed; 89 window/app, 174 core and 3 xtask tests passed;
 two existing core tests and the opt-in interaction timing test remained
 ignored in the normal suite. The interaction timing test was also run
-explicitly and passed on the combined branch. No private file contents were
+explicitly and passed on the combined branch. The latest optional replay
+passed on retry after GPUI reported filesystem-watcher thread activity as
+nondeterministic in the first attempt; its local timings are not used for
+the isolated main-only comparisons. No private file contents were
 inspected and no user files were removed by this investigation.
