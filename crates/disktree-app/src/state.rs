@@ -1792,16 +1792,10 @@ impl Disktree {
         let hovered = self.hovered.clone();
         let selected = self.selected.clone();
 
-        // Marks are paths; the mosaic thinks in crumbs. Resolve once per frame
-        // rather than building a path for every tile.
-        let mut marked: FxHashSet<Vec<usize>> = FxHashSet::default();
-        for item in self.marks.items() {
-            #[cfg(test)]
-            crate::marks::work::step();
-            if let Some(crumbs) = self.crumbs_for_path(&item.path) {
-                marked.insert(crumbs);
-            }
-        }
+        let marked = self.tree.as_ref().map_or_else(
+            || Arc::new(FxHashSet::default()),
+            |tree| self.marks.crumbs(&self.root_path, tree, metric),
+        );
 
         let Some(tiles) = self.layout().map(<[Tile]>::to_vec) else {
             return Mosaic {
@@ -1817,6 +1811,8 @@ impl Disktree {
         let mut decorations = Vec::with_capacity(tiles.len());
         let mut labels = Vec::new();
         for tile in &tiles {
+            #[cfg(test)]
+            crate::marks::work::TILES.set(crate::marks::work::TILES.get() + 1);
             let crumbs = tile.crumbs();
             let node = match &tile.kind {
                 TileKind::Node { crumbs } => self.node_at(crumbs),

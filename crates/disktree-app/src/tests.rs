@@ -1961,6 +1961,31 @@ fn marked_window_resolution_budget(cx: &mut TestAppContext) {
         let elapsed = start.elapsed();
         let frames = work::FRAMES.get();
         let operations = work::RESOLUTION.get();
+        let tiles = work::TILES.get();
+        assert!(tiles > 0 && tiles <= count * 4 * frames);
+        work::reset();
+        let warm_start = std::time::Instant::now();
+        for _ in 0..4 {
+            update(&view, window, |_, cx| cx.notify());
+            draw(window);
+        }
+        let warm_elapsed = warm_start.elapsed();
+        let warm_frames = work::FRAMES.get();
+        let warm_work = work::RESOLUTION.get();
+        assert!(warm_frames >= 4);
+        assert!(
+            warm_work <= 64 * warm_frames,
+            "unchanged renders must not resolve all marks: {warm_work}"
+        );
+        assert_eq!(
+            work::TILES.get() * frames,
+            tiles * warm_frames,
+            "visible tile work remains linear in frame count"
+        );
+        eprintln!(
+            "warm window M={count} prepares={warm_frames} resolution={warm_work} tiles={} wall={warm_elapsed:?}",
+            work::TILES.get()
+        );
         window.update(|window, _| window.remove_window());
         assert!(frames >= 4, "budget must cover actual renders: {frames}");
         assert!(operations > 0, "resolution instrumentation must run");
@@ -1980,4 +2005,61 @@ fn marked_window_resolution_budget(cx: &mut TestAppContext) {
         large <= 1024 * large_frames * 16,
         "absolute work cap: {large}"
     );
+}
+
+#[gpui_kit::test]
+fn marked_tiles_follow_metric_rescan_and_mark_changes(cx: &mut TestAppContext) {
+    use disktree_core::removal::Target;
+    use std::sync::Arc;
+
+    fn marked_paths(app: &mut Disktree) -> Vec<PathBuf> {
+        let mosaic = app.prepare();
+        let tiles = app.layout().expect("layout").to_vec();
+        tiles
+            .iter()
+            .zip(mosaic.tiles)
+            .filter_map(|(tile, deco)| {
+                deco.marked.then(|| app.path_at(tile.crumbs())).flatten()
+            })
+            .collect()
+    }
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, window) = view_over(temp.path(), cx);
+    let junk = temp.path().join("junk");
+    update(&view, window, |app, cx| {
+        app.marks.toggle(Target {
+            path: junk.clone(),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        cx.notify();
+    });
+    draw(window);
+    assert_eq!(
+        update(&view, window, |app, _| marked_paths(app)),
+        std::slice::from_ref(&junk)
+    );
+    update(&view, window, Disktree::toggle_metric);
+    draw(window);
+    assert_eq!(
+        update(&view, window, |app, _| marked_paths(app)),
+        std::slice::from_ref(&junk)
+    );
+    update(&view, window, |app, cx| {
+        let mut tree = (**app.tree.as_ref().expect("tree")).clone();
+        tree.children.reverse();
+        app.tree = Some(Arc::new(tree));
+        cx.notify();
+    });
+    draw(window);
+    assert_eq!(
+        update(&view, window, |app, _| marked_paths(app)),
+        std::slice::from_ref(&junk)
+    );
+    update(&view, window, |app, cx| app.unmark(&junk, cx));
+    draw(window);
+    assert!(update(&view, window, |app, _| marked_paths(app)).is_empty());
 }
