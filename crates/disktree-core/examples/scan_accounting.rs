@@ -22,7 +22,7 @@ fn main() -> std::io::Result<()> {
         },
     )?;
     println!(
-        "seconds={:.3} files={} listed={} clone_files={} clone_bytes={} duplicate_bytes={} private_bytes={} unknown_clones={}",
+        "seconds={:.3} files={} listed={} clone_files={} clone_bytes={} duplicate_bytes={} private_bytes={} unknown_clones={} reclaim_lower={} reclaim_upper={}",
         started.elapsed().as_secs_f64(),
         tree.files,
         tree.bytes,
@@ -30,7 +30,9 @@ fn main() -> std::io::Result<()> {
         tree.sharing().bytes,
         tree.sharing().duplicate_bytes,
         tree.sharing().private_bytes,
-        tree.sharing().unknown_files
+        tree.sharing().unknown_files,
+        tree.sharing().reclaimable(tree.bytes),
+        tree.sharing().possible(tree.bytes)
     );
     Ok(())
 }

@@ -75,7 +75,7 @@ pub struct Node {
     /// `(device, inode)` for files, used to de-duplicate hardlinks. No file
     /// has inode zero, which lets `None` cost nothing.
     pub inode: Option<(u64, NonZeroU64)>,
-    pub clone_info: Option<Box<crate::sharing::CloneInfo>>,
+    pub allocation: Option<Box<crate::sharing::Allocation>>,
     pub sharing: Option<Box<crate::sharing::Sharing>>,
     /// The directory could not be read; its contents are unknown.
     pub read_error: bool,
@@ -105,7 +105,7 @@ impl Node {
             files: 0,
             dirs: 1,
             inode: None,
-            clone_info: None,
+            allocation: None,
             sharing: None,
             read_error: false,
             modified: 0,
@@ -128,7 +128,7 @@ impl Node {
             files: u64::from(kind == NodeKind::File),
             dirs: 0,
             inode: None,
-            clone_info: None,
+            allocation: None,
             sharing: None,
             read_error: false,
             modified: 0,
@@ -140,7 +140,10 @@ impl Node {
 
     /// Sparse: ordinary files do not pay for five additional byte counters.
     pub fn sharing(&self) -> crate::sharing::Sharing {
-        self.sharing.as_deref().copied().unwrap_or_default()
+        self.sharing
+            .as_deref()
+            .copied()
+            .unwrap_or_else(|| crate::sharing::leaf_summary(self))
     }
 
     pub const fn is_dir(&self) -> bool {

@@ -94,6 +94,7 @@ pub struct Plan {
     /// Clone estimates are separate from listed allocation and its volumes.
     reclaimable_bytes: Option<u64>,
     reclaim_estimate: Option<u64>,
+    possible_bytes: Option<u64>,
 }
 
 impl Plan {
@@ -120,24 +121,42 @@ impl Plan {
         self.reclaimable_bytes.unwrap_or_else(|| self.bytes())
     }
 
-    /// Apply scan-derived savings without lending another volume's space to
-    /// this one's meter. Missing nodes contribute no unmeasured saving.
-    pub fn estimate_reclaim(
+    pub fn possible_bytes(&self) -> u64 {
+        self.possible_bytes
+            .unwrap_or_else(|| self.reclaimable_bytes())
+    }
+
+    /// Evaluate the accepted set together, preserving the guard's volume
+    /// attribution. An external volume can never inflate this volume's meter.
+    pub fn estimate_selection(
         &mut self,
-        estimate: impl Fn(&Target) -> Option<u64>,
+        mut estimate: impl FnMut(&[&Target]) -> crate::sharing::Estimate,
     ) {
-        let mut total = 0_u64;
-        let mut scanned = 0_u64;
-        for (target, attribution) in self.targets.iter().zip(&self.attribution)
-        {
-            let bytes = estimate(target).unwrap_or(0).min(target.bytes);
-            total = total.saturating_add(bytes);
-            if *attribution == crate::space::Attribution::Scanned {
-                scanned = scanned.saturating_add(bytes);
-            }
-        }
-        self.reclaimable_bytes = Some(total);
-        self.reclaim_estimate = Some(scanned);
+        let all: Vec<_> = self.targets.iter().collect();
+        let total = if all.is_empty() {
+            crate::sharing::Estimate::default()
+        } else {
+            estimate(&all)
+        };
+        let scanned: Vec<_> = self
+            .targets
+            .iter()
+            .zip(&self.attribution)
+            .filter_map(|(target, attribution)| {
+                (*attribution == crate::space::Attribution::Scanned)
+                    .then_some(target)
+            })
+            .collect();
+        let local = if scanned.is_empty() {
+            crate::sharing::Estimate::default()
+        } else if scanned.len() == all.len() {
+            total
+        } else {
+            estimate(&scanned)
+        };
+        self.reclaimable_bytes = Some(total.lower);
+        self.possible_bytes = Some(total.upper);
+        self.reclaim_estimate = Some(local.lower);
     }
 
     /// Bytes the targets free on other volumes, which the meter leaves out.
@@ -1929,7 +1948,14 @@ mod tests {
         assert_eq!(plan.foreign(), 600, "another disk, and a snapshot");
         assert_eq!(plan.unattributed(), 0);
         let mut estimated = plan;
-        estimated.estimate_reclaim(|target| Some(target.bytes / 2));
+        estimated.estimate_selection(|targets| {
+            let bytes = targets.iter().map(|target| target.bytes / 2).sum();
+            crate::sharing::Estimate {
+                lower: bytes,
+                upper: bytes,
+                partial: false,
+            }
+        });
         assert_eq!(estimated.reclaimable_bytes(), 350);
         assert_eq!(estimated.reclaim(), 50, "only this volume's estimate");
         assert_eq!(estimated.foreign(), 600, "listed foreign allocation");
@@ -1966,7 +1992,11 @@ mod tests {
         assert_eq!(plan.foreign(), 0);
         assert_eq!(plan.unattributed(), 50, "no saving may be claimed");
         let mut estimated = plan;
-        estimated.estimate_reclaim(|_| Some(25));
+        estimated.estimate_selection(|_| crate::sharing::Estimate {
+            lower: 25,
+            upper: 50,
+            partial: false,
+        });
         assert_eq!(estimated.reclaimable_bytes(), 25);
         assert_eq!(
             estimated.reclaim(),

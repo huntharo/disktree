@@ -230,6 +230,8 @@ impl ScanHandle {
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            clone_cache: crate::clone_cache::Cache::default(),
         });
         let (sender, result) = mpsc::channel();
 
@@ -280,6 +282,8 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
         visited_dirs: Mutex::new(FxHashSet::default()),
         root: Mutex::new(None),
         volume: OnceLock::new(),
+        #[cfg(target_os = "macos")]
+        clone_cache: crate::clone_cache::Cache::default(),
     });
     let node = scan_blocking(root, &context)?;
     progress.finish();
@@ -308,6 +312,8 @@ struct WalkContext {
     /// cannot leave it: every listing takes it instead of asking. See
     /// [`crate::windows::walk_volume`].
     volume: OnceLock<u64>,
+    #[cfg(target_os = "macos")]
+    clone_cache: crate::clone_cache::Cache,
 }
 
 impl WalkContext {
@@ -356,8 +362,8 @@ impl WalkContext {
             }
             Listing::Leaf(kind) => kind,
         };
-        match entry.facts(dir, self.options.apparent_size) {
-            Ok(facts) => self.leaf(entry.take_name(), kind, &facts),
+        match entry.facts(dir, self.options.apparent_size, self) {
+            Ok(facts) => self.leaf(entry.take_name(), kind, facts),
             Err(error) => {
                 self.progress.record_error(&entry.entry_path(dir), &error);
                 Classified::Skipped
@@ -424,6 +430,7 @@ impl WalkContext {
         Classified::Subdirectory {
             path,
             name: entry.take_name(),
+            followed: false,
         }
     }
 
@@ -437,7 +444,7 @@ impl WalkContext {
                     Classified::Entry(leaf_node(
                         name,
                         NodeKind::Symlink,
-                        &facts,
+                        facts,
                         facts.shared,
                     ))
                 }
@@ -473,6 +480,7 @@ impl WalkContext {
             return Classified::Subdirectory {
                 path: path.to_path_buf(),
                 name,
+                followed: true,
             };
         }
 
@@ -486,15 +494,11 @@ impl WalkContext {
                 .ok()
                 .and_then(|target| crate::macos::clone_info(&target, &meta));
         }
-        self.leaf(name, kind_of(&meta, meta.file_type()), &facts)
+        facts.followed = true;
+        self.leaf(name, kind_of(&meta, meta.file_type()), facts)
     }
 
-    fn leaf(
-        &self,
-        name: Box<str>,
-        kind: NodeKind,
-        facts: &Facts,
-    ) -> Classified {
+    fn leaf(&self, name: Box<str>, kind: NodeKind, facts: Facts) -> Classified {
         // A followed link reaches a file a second way, whatever its link
         // count says.
         let track = self.options.follow_links || facts.shared;
@@ -521,7 +525,12 @@ trait Listed {
     fn take_name(&mut self) -> Box<str>;
     fn listing(&self) -> io::Result<Listing>;
     /// Size, identity and age of a leaf.
-    fn facts(&self, _dir: &Path, apparent_size: bool) -> io::Result<Facts>;
+    fn facts(
+        &self,
+        _dir: &Path,
+        apparent_size: bool,
+        _context: &WalkContext,
+    ) -> io::Result<Facts>;
     /// What a directory is, read before the walk enters it.
     fn directory(&self) -> io::Result<Directory>;
     /// Hidden by an attribute rather than by a leading dot: on Windows,
@@ -557,6 +566,7 @@ enum Listing {
 }
 
 /// What a leaf contributes.
+#[derive(Clone, Copy)]
 struct Facts {
     size: u64,
     identity: Option<(u64, u64)>,
@@ -564,7 +574,9 @@ struct Facts {
     /// The file may have another name the walk could meet: its identity is
     /// worth keeping for hardlink de-duplication.
     shared: bool,
-    clone_info: Option<Box<crate::sharing::CloneInfo>>,
+    clone_info: Option<crate::sharing::CloneInfo>,
+    links: u64,
+    followed: bool,
 }
 
 impl Facts {
@@ -575,8 +587,21 @@ impl Facts {
             modified: modified_seconds(meta),
             shared: shares_inode(meta),
             clone_info: None,
+            links: link_count(meta),
+            followed: false,
         }
     }
+}
+
+#[cfg(unix)]
+fn link_count(meta: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.nlink()
+}
+
+#[cfg(not(unix))]
+fn link_count(_meta: &Metadata) -> u64 {
+    1
 }
 
 /// A standard directory entry with its name decoded once, up front.
@@ -613,7 +638,12 @@ impl Listed for Named {
         })
     }
 
-    fn facts(&self, _dir: &Path, apparent_size: bool) -> io::Result<Facts> {
+    fn facts(
+        &self,
+        _dir: &Path,
+        apparent_size: bool,
+        _context: &WalkContext,
+    ) -> io::Result<Facts> {
         let meta = self.entry.metadata()?;
         Ok(Facts::of(&meta, apparent_size))
     }
@@ -649,7 +679,12 @@ impl Listed for crate::macos::Entry {
         })
     }
 
-    fn facts(&self, dir: &Path, apparent_size: bool) -> io::Result<Facts> {
+    fn facts(
+        &self,
+        dir: &Path,
+        apparent_size: bool,
+        context: &WalkContext,
+    ) -> io::Result<Facts> {
         Ok(Facts {
             size: if apparent_size {
                 self.apparent()
@@ -662,8 +697,10 @@ impl Listed for crate::macos::Entry {
             clone_info: if apparent_size {
                 None
             } else {
-                self.clone_info(dir)
+                self.clone_info(dir, &context.clone_cache)
             },
+            links: self.links(),
+            followed: false,
         })
     }
 
@@ -697,7 +734,12 @@ impl Listed for crate::windows::Entry {
         })
     }
 
-    fn facts(&self, _dir: &Path, apparent_size: bool) -> io::Result<Facts> {
+    fn facts(
+        &self,
+        _dir: &Path,
+        apparent_size: bool,
+        _context: &WalkContext,
+    ) -> io::Result<Facts> {
         Ok(Facts {
             size: if apparent_size {
                 self.apparent()
@@ -710,6 +752,8 @@ impl Listed for crate::windows::Entry {
             // every file keeps one.
             shared: true,
             clone_info: None,
+            links: 1,
+            followed: false,
         })
     }
 
@@ -768,7 +812,11 @@ fn list(
 /// What a directory entry turned out to be.
 enum Classified {
     /// Descend into this directory on a new task.
-    Subdirectory { path: PathBuf, name: Box<str> },
+    Subdirectory {
+        path: PathBuf,
+        name: Box<str>,
+        followed: bool,
+    },
     /// A leaf that contributes size.
     Entry(Node),
     /// Filtered out, unreadable, or a symlink we chose not to follow.
@@ -787,6 +835,7 @@ struct PendingDir {
     partial: Mutex<Partial>,
     read_error: AtomicBool,
     depth: usize,
+    followed: bool,
 }
 
 /// What a directory's node is made of before it is built: the name the
@@ -815,6 +864,7 @@ impl PendingDir {
             }),
             read_error: AtomicBool::new(false),
             depth,
+            followed: false,
         }
     }
 
@@ -833,7 +883,15 @@ impl PendingDir {
             files: 0,
             dirs: 1,
             inode: None,
-            clone_info: None,
+            allocation: self.followed.then(|| {
+                Box::new(crate::sharing::Allocation {
+                    bytes: 0,
+                    identity: None,
+                    links: 1,
+                    followed: true,
+                    clone: None,
+                })
+            }),
             sharing: None,
             read_error: self.read_error.load(Ordering::Relaxed),
             modified: 0,
@@ -1111,14 +1169,20 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
                 match entry {
                     Ok(mut entry) => {
                         match context.classify(&dir.path, &mut entry) {
-                            Classified::Subdirectory { path, name } => {
+                            Classified::Subdirectory {
+                                path,
+                                name,
+                                followed,
+                            } => {
                                 tally.dirs += 1;
-                                subdirs.push(Arc::new(PendingDir::new(
+                                let mut child = PendingDir::new(
                                     path,
                                     name,
                                     Some(Arc::clone(dir)),
                                     dir.depth + 1,
-                                )));
+                                );
+                                child.followed = followed;
+                                subdirs.push(Arc::new(child));
                             }
                             Classified::Entry(node) => {
                                 tally.add(&node);
@@ -1221,7 +1285,7 @@ fn finish_tree(
 fn leaf_node(
     name: Box<str>,
     kind: NodeKind,
-    facts: &Facts,
+    facts: Facts,
     track: bool,
 ) -> Node {
     let mut node = Node::entry(name, kind, facts.size);
@@ -1231,7 +1295,19 @@ fn leaf_node(
             .and_then(|(device, file)| Some((device, NonZeroU64::new(file)?)));
     }
     node.modified = facts.modified;
-    node.clone_info.clone_from(&facts.clone_info);
+    if facts.clone_info.is_some()
+        || facts.links > 1
+        || facts.followed
+        || (track && cfg!(unix))
+    {
+        node.allocation = Some(Box::new(crate::sharing::Allocation {
+            bytes: facts.size,
+            identity: facts.identity,
+            links: facts.links,
+            followed: facts.followed,
+            clone: facts.clone_info,
+        }));
+    }
     node
 }
 
@@ -1480,6 +1556,8 @@ mod tests {
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            clone_cache: crate::clone_cache::Cache::default(),
         });
         let root = Arc::new(PendingDir::new(
             temp.path().to_path_buf(),
@@ -1760,6 +1838,8 @@ mod tests {
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
             volume: OnceLock::new(),
+            #[cfg(target_os = "macos")]
+            clone_cache: crate::clone_cache::Cache::default(),
         });
         let tree = scan_blocking(root, &context).expect("scan still succeeds");
         let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o700));

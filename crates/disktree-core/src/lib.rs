@@ -7,6 +7,8 @@
 
 pub mod access;
 pub mod classify;
+#[cfg(any(target_os = "macos", test))]
+mod clone_cache;
 pub mod export;
 pub mod filter;
 pub mod insights;

@@ -267,7 +267,7 @@ fn delete_dialog(
     };
     let body = format!(
         "Estimated to free ≈ {}. Shared blocks and snapshots may retain space. Deleted files can\u{2019}t be recovered; move them to the trash if you might need them again.",
-        human_bytes(plan.reclaimable_bytes())
+        savings(plan.reclaimable_bytes(), plan.possible_bytes())
     );
     let confirm = cx.entity().downgrade();
     let cancel = confirm.clone();
@@ -1454,14 +1454,17 @@ fn selection_section(
             cx,
         ))
         .child(widgets::bar(share, highlight, cx))
-        .when(node.sharing().files > 0, |this| {
+        .when(node.sharing().estimate.is_some(), |this| {
             this.child(
                 div()
                     .text_size(text::CAPTION)
                     .text_color(theme.secondary)
                     .child(format!(
-                        "APFS clones · frees ≈ {} excluding shared blocks",
-                        human_bytes(node.sharing().reclaimable(node.bytes))
+                        "Estimated space freed · ≈ {}",
+                        savings(
+                            node.sharing().reclaimable(node.bytes),
+                            node.sharing().possible(node.bytes)
+                        )
                     )),
             )
             .when(node.sharing().unknown_files > 0, |this| {
@@ -2612,7 +2615,7 @@ fn review(
             &format!(
                 "{} marked \u{00b7} ≈ {} to free",
                 app.marks.len(),
-                human_bytes(plan.reclaimable_bytes())
+                savings(plan.reclaimable_bytes(), plan.possible_bytes())
             ),
             &theme,
             cx,
@@ -2832,7 +2835,7 @@ fn review_summary(
                     } else {
                         "Estimated space freed"
                     },
-                    human_bytes(plan.reclaimable_bytes()),
+                    savings(plan.reclaimable_bytes(), plan.possible_bytes()),
                     cx,
                 ))
                 .children(left_out),
@@ -2841,7 +2844,7 @@ fn review_summary(
     if cfg!(target_os = "macos") {
         panel = panel.child(div().text_size(text::CAPTION)
             .text_color(theme.secondary)
-            .child("Estimate excludes shared clone blocks. Removing all copies together can free more; snapshots can retain space. Rescan to update estimates."));
+            .child("Complete clone groups count shared data once. Remaining hardlinks retain file data. Ranges show unmeasured sharing; snapshots and open files can retain space. Rescan to update estimates."));
     }
     if let Some(volume) = app.space {
         panel = panel.child(
@@ -3666,4 +3669,13 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                         )),
                 ),
         )
+}
+
+/// Both ends are scan-derived; the meter uses the lower bound only.
+fn savings(lower: u64, upper: u64) -> String {
+    if lower == upper {
+        human_bytes(lower)
+    } else {
+        format!("{}–{}", human_bytes(lower), human_bytes(upper))
+    }
 }

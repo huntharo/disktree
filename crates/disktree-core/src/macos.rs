@@ -30,10 +30,13 @@ use crate::sharing::CloneInfo;
 const BUFFER_BYTES: usize = 64 * 1024;
 
 const REFCNT: u32 = 0x1000;
-const MAY_SHARE: u64 = 0x1 | 0x40;
+const FULL_SHARE: u64 = 0x40;
+const MAY_SHARE: u64 = 0x1 | FULL_SHARE;
 const EXTENDED: u32 = libc::FSOPT_ATTR_CMN_EXTENDED;
 const RETURNED: u32 = libc::ATTR_CMN_RETURNED_ATTRS;
-const HINTS: u32 = libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
+const REAL_DEVICE: u32 = 0x40;
+const HINTS: u32 =
+    REAL_DEVICE | libc::ATTR_CMNEXT_CLONEID | libc::ATTR_CMNEXT_EXT_FLAGS;
 
 // From <sys/attr.h> and <sys/vnode.h>, which the libc crate does not cover.
 const ATTR_BIT_MAP_COUNT: u16 = 5;
@@ -127,7 +130,7 @@ pub struct Entry {
     inode: u64,
     links: u32,
     flags: u32,
-    hints: Option<(u64, u64)>,
+    hints: Option<(u64, u64, u64)>,
 }
 
 impl Entry {
@@ -174,8 +177,13 @@ impl Entry {
     }
 
     /// `(st_dev, st_ino)`: the same for two names of one file.
-    pub const fn identity(&self) -> (u64, u64) {
-        (self.device, self.inode)
+    pub fn identity(&self) -> (u64, u64) {
+        (
+            self.hints.map_or(self.device, |(device, _, _)| {
+                if device == 0 { self.device } else { device }
+            }),
+            self.inode,
+        )
     }
 
     pub const fn device(&self) -> u64 {
@@ -183,6 +191,10 @@ impl Entry {
     }
 
     /// Whether the file has more than one name.
+    pub const fn links(&self) -> u64 {
+        self.links as u64
+    }
+
     pub const fn shared(&self) -> bool {
         self.links > 1
     }
@@ -195,17 +207,29 @@ impl Entry {
 
     /// Only clone candidates pay for private-size reads; ordinary metadata
     /// and identity remain the values returned by the bulk listing.
-    pub fn clone_info(&self, dir: &Path) -> Option<Box<CloneInfo>> {
-        let (id, flags) = self.hints?;
+    pub fn clone_info(
+        &self,
+        dir: &Path,
+        cache: &crate::clone_cache::Cache,
+    ) -> Option<CloneInfo> {
+        let (device, id, flags) = self.hints?;
         if self.kind != Kind::File || flags & MAY_SHARE == 0 {
             return None;
         }
-        Some(Box::new(private_info(
-            &self.path(dir),
-            self.device,
-            self.inode,
+        let measure = || private_info(&self.path(dir), device, self.inode, id);
+        if flags & FULL_SHARE == 0 {
+            return Some(measure());
+        }
+        // A resource fork can differ even when the data fork is cloned.
+        // Reuse only when the listing agrees with the cached data allocation.
+        Some(cache.get(
+            device,
             id,
-        )))
+            self.inode,
+            u64::from(self.links),
+            self.allocated,
+            measure,
+        ))
     }
 
     fn named(name: &[u8]) -> (Box<str>, Option<Box<OsStr>>) {
@@ -524,6 +548,11 @@ impl<'a> Cursor<'a> {
         } else {
             return Ok(None);
         };
+        let real_device = if extended & REAL_DEVICE != 0 {
+            u64::from(self.u32()?)
+        } else {
+            0
+        };
         let clone_id = if extended & libc::ATTR_CMNEXT_CLONEID != 0 {
             Some(self.u64()?)
         } else {
@@ -534,7 +563,9 @@ impl<'a> Cursor<'a> {
         } else {
             None
         };
-        let hints = clone_id.zip(clone_flags);
+        let hints = clone_id
+            .zip(clone_flags)
+            .map(|(id, flags)| (real_device, id, flags));
         let (name, exact) = Entry::named(name);
         Ok(Some(Entry {
             name,
@@ -763,9 +794,20 @@ fn private_info(path: &Path, device: u64, inode: u64, id: u64) -> CloneInfo {
     {
         return info;
     }
-    // Packed order: fileid, dataallocsize, privatesize, cloneid, flags, refcnt.
+    // Packed order includes realdevid before cloneid, even when unavailable.
+    // PACK_INVAL_ATTRS reserves its slot; ordinary st_dev can alias APFS
+    // System and Data volumes and must never substitute for this identity.
+    let real_device = if extended & REAL_DEVICE != 0 {
+        u64::from(clone_read_u32(buffer, 48).unwrap_or(0))
+    } else {
+        0
+    };
+    if device != 0 && device != real_device {
+        return info;
+    }
+    info.device = real_device;
     if extended & libc::ATTR_CMNEXT_CLONEID == 0
-        || clone_read_u64(buffer, 48) != Some(id)
+        || clone_read_u64(buffer, 52) != Some(id)
     {
         return info;
     }
@@ -776,7 +818,7 @@ fn private_info(path: &Path, device: u64, inode: u64, id: u64) -> CloneInfo {
         info.data_bytes = clone_read_u64(buffer, 32).unwrap_or(0);
     }
     if extended & REFCNT != 0 {
-        info.references = clone_read_u32(buffer, 64).unwrap_or(0);
+        info.references = clone_read_u32(buffer, 68).unwrap_or(0);
     }
     info
 }
@@ -789,10 +831,10 @@ fn clone_read_u64(bytes: &[u8], at: usize) -> Option<u64> {
 }
 
 /// Exceptional path for followed symlinks; ordinary entries use bulk hints.
-pub fn clone_info(path: &Path, meta: &Metadata) -> Option<Box<CloneInfo>> {
+pub fn clone_info(path: &Path, meta: &Metadata) -> Option<CloneInfo> {
     let path_c = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut request = clone_attrs(0, 0, HINTS);
-    let mut buffer = [0_u8; 40];
+    let mut buffer = [0_u8; 48];
     // SAFETY: valid path, ABI request and writable buffer of the stated size.
     let result = unsafe {
         libc::getattrlist(
@@ -805,16 +847,16 @@ pub fn clone_info(path: &Path, meta: &Metadata) -> Option<Box<CloneInfo>> {
     };
     if result != 0
         || clone_read_u32(&buffer, 20)? & HINTS != HINTS
-        || clone_read_u64(&buffer, 32)? & MAY_SHARE == 0
+        || clone_read_u64(&buffer, 36)? & MAY_SHARE == 0
     {
         return None;
     }
-    Some(Box::new(private_info(
+    Some(private_info(
         path,
-        meta.dev(),
+        u64::from(clone_read_u32(&buffer, 24)?),
         meta.ino(),
-        clone_read_u64(&buffer, 24)?,
-    )))
+        clone_read_u64(&buffer, 28)?,
+    ))
 }
 
 #[cfg(test)]
@@ -870,6 +912,72 @@ mod clone_tests {
         )
         .expect("apparent scan");
         assert_eq!(apparent.sharing().files, 0);
+    }
+
+    #[test]
+    fn real_clone_hardlinks_and_followed_names_have_set_level_savings() {
+        let temp = fixture();
+        let original = temp.path().join("original");
+        fs::hard_link(&original, temp.path().join("alias")).expect("hardlink");
+        std::os::unix::fs::symlink(&original, temp.path().join("followed"))
+            .expect("symlink");
+        let tree = scan(
+            temp.path(),
+            ScanOptions {
+                follow_links: true,
+                ..ScanOptions::default()
+            },
+        )
+        .expect("scan");
+        let by_name = |name: &str| {
+            tree.children
+                .iter()
+                .find(|node| node.name.as_ref() == name)
+                .expect("entry")
+        };
+        let original = by_name("original");
+        let alias = by_name("alias");
+        let clone = by_name("clone");
+        let followed = by_name("followed");
+        for node in [original, alias, clone, followed] {
+            assert_eq!(crate::sharing::estimate([node]).lower, 0);
+        }
+        assert_eq!(crate::sharing::estimate([original, clone]).lower, 0);
+        assert_eq!(
+            crate::sharing::estimate([original, alias, clone]).lower,
+            8 * 1024 * 1024
+        );
+        assert_eq!(tree.sharing().reclaimable(tree.bytes), 8 * 1024 * 1024);
+        for node in [original, alias, clone] {
+            assert_ne!(
+                node.allocation
+                    .as_deref()
+                    .expect("allocation")
+                    .clone
+                    .expect("clone")
+                    .device,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn resource_fork_allocation_remains_in_the_range_for_full_clones() {
+        let temp = fixture();
+        let fork = temp.path().join("clone/..namedfork/rsrc");
+        fs::write(fork, vec![0x31; 4096]).expect("resource fork");
+        let tree = scan(temp.path(), ScanOptions::default()).expect("scan");
+        assert_eq!(tree.sharing().private_bytes, 0);
+        assert_eq!(tree.sharing().reclaimable(tree.bytes), 8 * 1024 * 1024);
+        assert_eq!(tree.sharing().possible(tree.bytes), 8 * 1024 * 1024 + 4096);
+        assert_eq!(tree.sharing().duplicate_bytes, 8 * 1024 * 1024);
+        let clone = tree
+            .children
+            .iter()
+            .find(|node| node.name.as_ref() == "clone")
+            .expect("clone");
+        assert_eq!(clone.sharing().reclaimable(clone.bytes), 0);
+        assert_eq!(clone.sharing().possible(clone.bytes), 4096);
     }
 
     #[test]

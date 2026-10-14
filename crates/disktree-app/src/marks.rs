@@ -97,7 +97,7 @@ impl Marks {
 
     /// Re-read sizes from a freshly scanned tree. Missing paths stay marked
     /// with zero bytes, so they cannot claim space that is already gone.
-    pub fn refresh(&mut self, root_path: &Path, root: &Node, metric: Metric) {
+    pub fn refresh(&mut self, root_path: &Path, root: &Node, _metric: Metric) {
         self.resolved = None;
         let mut resolver = Resolver::new(root_path, root);
         let mut resolved = Vec::with_capacity(self.items.len());
@@ -106,7 +106,7 @@ impl Marks {
             work::step();
             match resolver.resolve(&item.path) {
                 Some((_, node)) => resolved.push(Target {
-                    bytes: node.value(metric),
+                    bytes: node.bytes,
                     is_dir: node.is_dir(),
                     hidden: is_hidden(&item.path),
                     path: item.path.clone(),

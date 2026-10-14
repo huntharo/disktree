@@ -1,0 +1,57 @@
+   Compiling libc v0.2.189
+   Compiling crossbeam-utils v0.8.23
+   Compiling crossbeam-epoch v0.9.21
+   Compiling crossbeam-deque v0.8.8
+   Compiling autocfg v1.5.1
+   Compiling objc2 v0.6.4
+   Compiling bitflags v2.13.2
+   Compiling getrandom v0.4.3
+   Compiling rustix v1.1.4
+   Compiling core-foundation-sys v0.8.7
+   Compiling objc2-encode v4.1.0
+   Compiling rayon-core v1.13.0
+   Compiling cfg-if v1.0.4
+   Compiling percent-encoding v2.3.2
+   Compiling memchr v2.8.3
+   Compiling once_cell v1.21.4
+   Compiling either v1.18.0
+   Compiling fastrand v2.5.0
+   Compiling log v0.4.34
+   Compiling iana-time-zone v0.1.65
+   Compiling rustc-hash v2.1.3
+   Compiling num-traits v0.2.19
+   Compiling objc2-foundation v0.3.2
+   Compiling trash v5.2.9
+   Compiling errno v0.3.14
+   Compiling sysinfo v0.31.4
+   Compiling rayon v1.12.0
+   Compiling chrono v0.4.45
+   Compiling tempfile v3.27.0
+   Compiling disktree-core v0.11.0 (/private/var/folders/07/183kkj1d7l59l67s4tq0dmyr0000gn/T/disktree-accounting-red-e2t2vxnq/crates/disktree-core)
+    Finished `test` profile [optimized + debuginfo] target(s) in 7.74s
+     Running unittests src/lib.rs (target/debug/deps/disktree_core-8aad222ba4e32dfe)
+
+running 2 tests
+
+thread 'sharing::tests::regression_complete_clone_group' (403629209) panicked at crates/disktree-core/src/sharing.rs:218:9:
+assertion `left == right` failed
+  left: 0
+ right: 80
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test sharing::tests::regression_complete_clone_group ... FAILED
+
+thread 'sharing::tests::regression_retained_hardlink' (403629210) panicked at crates/disktree-core/src/sharing.rs:227:9:
+assertion `left == right` failed
+  left: 4096
+ right: 0
+test sharing::tests::regression_retained_hardlink ... FAILED
+
+failures:
+
+failures:
+    sharing::tests::regression_complete_clone_group
+    sharing::tests::regression_retained_hardlink
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 158 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p disktree-core --lib`

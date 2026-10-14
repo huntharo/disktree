@@ -1772,6 +1772,40 @@ fn apfs_clones_use_private_bytes_in_review_and_refresh(
     });
     draw(cx);
     update(&view, cx, |app, _| app.confirm_open = false);
+    // Separate marks complete the group. Changing tile weights must never
+    // turn the review's byte values into file counts.
+    update(&view, cx, |app, cx| {
+        app.options.metric = disktree_core::tree::Metric::Files;
+        let index = app
+            .tree()
+            .expect("tree")
+            .children
+            .iter()
+            .position(|node| node.name.as_ref() == "original")
+            .expect("original");
+        app.toggle_mark(&[index], cx);
+        let plan = app.plan();
+        assert_eq!(plan.bytes(), 16 * 1024 * 1024);
+        assert_eq!(plan.reclaimable_bytes(), 8 * 1024 * 1024);
+        assert_eq!(plan.possible_bytes(), 8 * 1024 * 1024);
+    });
+    draw(cx);
+    crate::marks::work::reset();
+    read(&view, cx, |app| {
+        for _ in 0..4 {
+            assert_eq!(app.plan().reclaimable_bytes(), 8 * 1024 * 1024);
+        }
+    });
+    assert_eq!(
+        crate::marks::work::RESOLUTION.get(),
+        0,
+        "warm plans must not resolve paths again"
+    );
+    update(&view, cx, |app, _| {
+        app.marks.remove(&root.join("original"));
+        assert_eq!(app.plan().reclaimable_bytes(), 0);
+        app.options.metric = disktree_core::tree::Metric::Bytes;
+    });
     // Break sharing and refresh the same absolute-path mark.
     std::fs::remove_file(root.join("copies/clone")).expect("remove clone");
     std::fs::write(root.join("copies/clone"), vec![0x31; 8 * 1024 * 1024])

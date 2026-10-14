@@ -4,10 +4,10 @@
 //! decisions — what is selected, what a mark means, what a key does, when to
 //! re-scan — live here so they can be reasoned about in one place.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use disktree_core::access::file_table_readable;
@@ -321,6 +321,15 @@ pub struct RunSummary {
     pub failed: usize,
 }
 
+/// Scan-derived display estimates; never cached removal authorization.
+#[derive(Default)]
+struct AccountingCache {
+    tree: Weak<Node>,
+    root: PathBuf,
+    // Total and scanned-volume subsets only: bounded by the current marks.
+    estimates: Vec<(Vec<PathBuf>, disktree_core::sharing::Estimate)>,
+}
+
 /// Everything the app knows and everything it can do.
 pub struct Disktree {
     /// The directory the tree was scanned from.
@@ -360,6 +369,7 @@ pub struct Disktree {
     pub transition: Option<LayoutTransition>,
     pub layout_options: LayoutOptions,
     cache: Option<LayoutCache>,
+    accounting: RefCell<AccountingCache>,
 
     /// Mouse position in treemap-local pixels, for hit-testing and the tooltip.
     pub pointer: Option<Point<Pixels>>,
@@ -495,6 +505,7 @@ impl Disktree {
                 ..LayoutOptions::default()
             },
             cache: None,
+            accounting: RefCell::new(AccountingCache::default()),
             pointer: None,
             treemap_origin: Rc::new(Cell::new(Point::new(px(0.), px(0.)))),
             treemap_size: Rc::new(Cell::new(size(px(0.), px(0.)))),
@@ -1749,7 +1760,7 @@ impl Disktree {
         Some(Target {
             hidden: is_hidden(&path),
             path,
-            bytes: node.value(self.options.metric),
+            bytes: node.bytes,
             is_dir: node.is_dir(),
         })
     }
@@ -1768,11 +1779,55 @@ impl Disktree {
     /// The plan the review screen shows and the removal runs.
     pub fn plan(&self) -> Plan {
         let mut plan = plan(self.marks.items(), &self.root_path);
-        if let Some(tree) = self.tree() {
-            plan.estimate_reclaim(|target| {
-                crate::marks::find(&self.root_path, tree, &target.path)
-                    .map(|node| node.sharing().reclaimable(node.bytes))
+        if let Some(tree) = &self.tree {
+            let mut cached = self.accounting.borrow_mut();
+            if !cached.tree.ptr_eq(&Arc::downgrade(tree))
+                || cached.root != self.root_path
+            {
+                *cached = AccountingCache {
+                    tree: Arc::downgrade(tree),
+                    root: self.root_path.clone(),
+                    estimates: Vec::new(),
+                };
+            }
+            let mut resolver =
+                crate::marks::Resolver::new(&self.root_path, tree);
+            let mut next = Vec::new();
+            plan.estimate_selection(|targets| {
+                let paths: Vec<_> =
+                    targets.iter().map(|target| target.path.clone()).collect();
+                let value = cached
+                    .estimates
+                    .iter()
+                    .find(|(old, _)| *old == paths)
+                    .map_or_else(
+                        || {
+                            let nodes: Vec<_> = targets
+                                .iter()
+                                .filter_map(|target| {
+                                    resolver
+                                        .resolve(&target.path)
+                                        .map(|(_, node)| node)
+                                })
+                                .collect();
+                            if let [node] = nodes.as_slice() {
+                                node.sharing().estimate.unwrap_or(
+                                    disktree_core::sharing::Estimate {
+                                        lower: node.bytes,
+                                        upper: node.bytes,
+                                        partial: false,
+                                    },
+                                )
+                            } else {
+                                disktree_core::sharing::estimate(nodes)
+                            }
+                        },
+                        |(_, value)| *value,
+                    );
+                next.push((paths, value));
+                value
             });
+            cached.estimates = next;
         }
         plan
     }
