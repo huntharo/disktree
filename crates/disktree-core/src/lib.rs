@@ -14,6 +14,7 @@ pub mod insights;
 mod macos;
 #[cfg(windows)]
 mod mft;
+pub mod query;
 pub mod removal;
 pub mod scan;
 pub mod scan_threads;
