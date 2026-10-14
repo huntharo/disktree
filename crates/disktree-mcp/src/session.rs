@@ -1658,7 +1658,8 @@ mod tests {
             .expect("find");
         assert!(files.contains("blob.bin"), "{files}");
         assert!(files.contains("image.iso"), "{files}");
-        assert!(files.contains("debug/app"), "{files}");
+        let app_path = Path::new("debug").join("app");
+        assert!(files.contains(&app_path.display().to_string()), "{files}");
         assert!(!files.contains("todo.txt"), "{files}");
 
         let reclaim = session
