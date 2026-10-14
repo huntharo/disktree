@@ -4,6 +4,8 @@
 //! re-scanned after a removal, and a mark must survive that (or be reported as
 //! gone) rather than silently pointing at a different node.
 
+use std::collections::BTreeSet;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
@@ -54,7 +56,10 @@ pub mod work {
 #[derive(Debug, Default)]
 pub struct Marks {
     items: Vec<Target>,
-    index: FxHashSet<PathBuf>,
+    // Path's component ordering makes descendants contiguous. The same
+    // index answers exact membership and whether a parent has any marks
+    // inside, without storing ancestor counts or scanning every mark.
+    index: BTreeSet<PathBuf>,
     resolved: Option<ResolvedMarks>,
 }
 
@@ -71,6 +76,54 @@ struct ResolvedMarks {
 impl Marks {
     pub fn contains(&self, path: &Path) -> bool {
         self.index.contains(path)
+    }
+
+    /// Outermost marked ancestor, excluding the path itself. Keep the
+    /// spelling stored with the mark, using the same Path semantics as
+    /// exact membership and the old `starts_with` scan.
+    pub fn ancestor(&self, path: &Path) -> Option<&Path> {
+        path.ancestors()
+            .skip(1)
+            .filter_map(|ancestor| {
+                #[cfg(test)]
+                work::MARKING.set(work::MARKING.get() + 1);
+                self.index.get(ancestor)
+            })
+            .last()
+            .map(PathBuf::as_path)
+    }
+
+    /// Drop strict descendants in one stable compaction, retaining the
+    /// parent's mark and unrelated marks in their existing order.
+    pub fn absorb(&mut self, path: &Path) -> usize {
+        #[cfg(test)]
+        work::MARKING.set(work::MARKING.get() + 1);
+        let has_descendant = self
+            .index
+            .range::<Path, _>((Excluded(path), Unbounded))
+            .next()
+            .is_some_and(|next| next.starts_with(path));
+        // Most insertions are disjoint; proving that from the index keeps
+        // queuing M paths from doing M full scans of the ordered item list.
+        if !has_descendant {
+            return 0;
+        }
+        self.resolved = None;
+        let before = self.items.len();
+        let index = &mut self.index;
+        self.items.retain(|item| {
+            #[cfg(test)]
+            work::COMPACTION.set(work::COMPACTION.get() + 1);
+            if item.path != path && item.path.starts_with(path) {
+                #[cfg(test)]
+                work::MARKING.set(work::MARKING.get() + 1);
+                index.remove(&item.path);
+                false
+            } else {
+                true
+            }
+        });
+        before - self.items.len()
     }
 
     pub fn items(&self) -> &[Target] {
@@ -423,6 +476,110 @@ mod tests {
                 .0,
             [0]
         );
+    }
+
+    #[test]
+    fn ordered_marks_preserve_components_case_and_outermost_ancestor() {
+        let mut marks = Marks::default();
+        for path in [
+            "/synthetic/a/child",
+            "/synthetic/a",
+            "/synthetic/a-b",
+            "/synthetic/a.b",
+            "/synthetic/ab",
+            "/synthetic/A",
+        ] {
+            marks.toggle(target(path, 1));
+        }
+        assert_eq!(
+            marks.ancestor(Path::new("/synthetic/a/child/file")),
+            Some(Path::new("/synthetic/a"))
+        );
+        assert_eq!(marks.ancestor(Path::new("/synthetic/a")), None);
+        assert_eq!(
+            marks.ancestor(Path::new("/synthetic/a-b/file")),
+            Some(Path::new("/synthetic/a-b"))
+        );
+        assert_eq!(
+            marks.ancestor(Path::new("/synthetic/A/file")),
+            Some(Path::new("/synthetic/A"))
+        );
+        assert_eq!(marks.absorb(Path::new("/synthetic/a")), 1);
+        let expected: Vec<_> = [
+            "/synthetic/a",
+            "/synthetic/a-b",
+            "/synthetic/a.b",
+            "/synthetic/ab",
+            "/synthetic/A",
+        ]
+        .map(PathBuf::from)
+        .into();
+        assert_eq!(
+            marks
+                .items()
+                .iter()
+                .map(|item| item.path.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(marks.items().iter().all(|item| marks.contains(&item.path)));
+        assert!(!marks.contains(Path::new("/synthetic/a/child")));
+        marks.remove(Path::new("/synthetic/a"));
+        assert_eq!(marks.ancestor(Path::new("/synthetic/a/file")), None);
+        assert_eq!(
+            marks.absorb(Path::new("/synthetic/a")),
+            0,
+            "prefix lookalikes stay marked"
+        );
+        marks.clear();
+        assert_eq!(marks.absorb(Path::new("/synthetic")), 0);
+    }
+
+    #[test]
+    fn absorption_invalidates_cached_crumbs_and_keeps_missing_paths_indexed() {
+        let root_path = Path::new("/home/tobi");
+        let root = Arc::new(tree());
+        let mut marks = Marks::default();
+        marks.toggle(target("/home/tobi/.cache/blob.bin", 0));
+        marks.toggle(target("/home/tobi/.cache", 0));
+        marks.toggle(target("/home/tobi/gone/nested", 100));
+        let before = marks.crumbs(root_path, &root, Metric::Bytes);
+        assert_eq!(before.len(), 2);
+        assert_eq!(marks.absorb(Path::new("/home/tobi/.cache")), 1);
+        let after = marks.crumbs(root_path, &root, Metric::Bytes);
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.len(), 1);
+        assert!(after.contains(&vec![0]));
+        marks.refresh(root_path, &root, Metric::Files);
+        assert!(marks.contains(Path::new("/home/tobi/gone/nested")));
+        assert_eq!(marks.absorb(Path::new("/home/tobi/gone")), 1);
+        assert!(!marks.contains(Path::new("/home/tobi/gone/nested")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordered_marks_keep_exact_non_utf8_paths() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = Path::new("/synthetic");
+        let parent = root.join(std::ffi::OsStr::from_bytes(b"not-\xff"));
+        let child = parent.join("file");
+        let mut marks = Marks::default();
+        marks.toggle(Target {
+            path: child.clone(),
+            bytes: 1,
+            is_dir: false,
+            hidden: false,
+        });
+        marks.toggle(Target {
+            path: parent.clone(),
+            bytes: 1,
+            is_dir: true,
+            hidden: false,
+        });
+        assert_eq!(marks.ancestor(&child), Some(parent.as_path()));
+        assert_eq!(marks.absorb(&parent), 1);
+        assert!(marks.contains(&parent));
+        assert!(!marks.contains(&child));
     }
 
     #[test]

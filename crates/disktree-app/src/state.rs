@@ -1717,28 +1717,14 @@ impl Disktree {
         let path = target.path.clone();
         if self.marks.toggle(target) {
             self.space_baseline = self.space_baseline.or(self.space);
-            let inside: Vec<PathBuf> = self
-                .marks
-                .items()
-                .iter()
-                .filter(|item| {
-                    #[cfg(test)]
-                    crate::marks::work::MARKING
-                        .set(crate::marks::work::MARKING.get() + 1);
-                    item.path != path && item.path.starts_with(&path)
-                })
-                .map(|item| item.path.clone())
-                .collect();
-            for inner in &inside {
-                self.marks.remove(inner);
-            }
-            if !inside.is_empty() {
+            let inside = self.marks.absorb(&path);
+            if inside > 0 {
                 self.notice = Some((
                     format!(
                         "{} now covers {} mark{} inside it",
                         display_path(&path, self.home.as_deref()),
-                        inside.len(),
-                        if inside.len() == 1 { "" } else { "s" }
+                        inside,
+                        if inside == 1 { "" } else { "s" }
                     ),
                     Status::Neutral,
                 ));
@@ -1749,17 +1735,7 @@ impl Disktree {
 
     /// The marked directory `path` is inside, if any; never `path` itself.
     pub fn marked_ancestor(&self, path: &Path) -> Option<PathBuf> {
-        self.marks
-            .items()
-            .iter()
-            .filter(|item| {
-                #[cfg(test)]
-                crate::marks::work::MARKING
-                    .set(crate::marks::work::MARKING.get() + 1);
-                item.path != path && path.starts_with(&item.path)
-            })
-            .map(|item| item.path.clone())
-            .min_by_key(|ancestor| ancestor.as_os_str().len())
+        self.marks.ancestor(path).map(Path::to_path_buf)
     }
 
     pub fn target_at(&self, crumbs: &[usize]) -> Option<Target> {
