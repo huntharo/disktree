@@ -2426,3 +2426,50 @@ fn covered_review_status_budget(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     review_status_budget(cx, true);
 }
+
+#[gpui_kit::test]
+fn folder_queue_construction_budget(cx: &mut TestAppContext) {
+    use crate::marks::work;
+    use disktree_core::tree::{Node, NodeKind, aggregate};
+    use std::sync::Arc;
+
+    cx.update(gpui_omarchy::init);
+    let mut measure = |count| {
+        let (_temp, view, window) = queue_budget_view(count, cx);
+        let operations = update(&view, window, |app, cx| {
+            let metric = app.options.metric;
+            let tree = Arc::make_mut(app.tree.as_mut().expect("tree"));
+            for child in &mut tree.children[0].children {
+                child.kind = NodeKind::Directory;
+                child
+                    .children
+                    .push(Node::entry("payload", NodeKind::File, 1));
+            }
+            aggregate(tree, metric);
+            work::reset();
+            let start = std::time::Instant::now();
+            for index in 0..count {
+                app.toggle_mark(&[0, index], cx);
+            }
+            assert_eq!(app.marks.len(), count);
+            assert!(app.marks.items().iter().all(|item| item.is_dir));
+            assert_eq!(work::FRAMES.get(), 0);
+            let operations = work::MARKING.get() + work::COMPACTION.get();
+            assert!(operations > 0);
+            eprintln!(
+                "folder-queue M={count} work={operations} wall={:?}",
+                start.elapsed()
+            );
+            operations
+        });
+        window.update(|window, _| window.remove_window());
+        operations
+    };
+    let small = measure(128);
+    let large = measure(1024);
+    assert!(large <= small * 16, "8x folders: {small} -> {large}");
+    assert!(
+        large <= 1024 * 32,
+        "absolute folder insertion budget: {large}"
+    );
+}
