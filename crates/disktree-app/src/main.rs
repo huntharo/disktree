@@ -13,6 +13,7 @@
 
 mod app_menu;
 mod appearance;
+mod chrome;
 mod git;
 mod marks;
 mod palette;
@@ -161,8 +162,22 @@ fn run() -> Result<()> {
                                 )
                                 .into(),
                             ),
-                            ..Default::default()
+                            // The title strip is the title bar: macOS and
+                            // Windows give it the top of the window, and
+                            // AppKit puts its stoplights into it, centred on
+                            // the band. Linux reads neither; there the
+                            // compositor decides (see `chrome::Frame`).
+                            appears_transparent: true,
+                            traffic_light_position: Some(gpui_kit::point(
+                                px(ui::chrome::STOPLIGHTS.0),
+                                px(ui::chrome::STOPLIGHTS.1),
+                            )),
                         }),
+                        // On macOS the strip moves the window itself, so
+                        // AppKit does not hold back clicks on the trail and
+                        // the settings to see whether they are a double
+                        // click on the title bar.
+                        app_owns_titlebar_drag: true,
                         // Wayland app id. Hyprland reports it as the window
                         // class, and the desktop entry's StartupWMClass and
                         // the documented window rule both match `disktree`.
@@ -179,6 +194,13 @@ fn run() -> Result<()> {
                             appearance::follow(window);
                         }
                         cx.new(|cx| {
+                            // A desktop that moves its window buttons to
+                            // the other side moves them here too.
+                            cx.observe_button_layout_changed(
+                                window,
+                                |_, _, cx| cx.notify(),
+                            )
+                            .detach();
                             let mut app = Disktree::new(
                                 root_for_app.clone(),
                                 options.clone(),

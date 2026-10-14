@@ -30,7 +30,7 @@ use gpui_kit::{
     MouseMoveEvent, NavigationDirection, Pixels, Point, Render, ScrollDelta,
     ScrollWheelEvent, Size, Window, px, size,
 };
-use gpui_omarchy::Status;
+use gpui_omarchy::{ActiveTheme as _, Status};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::git::GitState;
@@ -378,8 +378,17 @@ pub struct Disktree {
     /// Focus to move on the next occasion a window is in hand. Key handling
     /// has no window, and opening or closing the dialog must move focus.
     pub focus_request: Option<FocusTarget>,
-    /// What the titlebar says, so it is only set when it changes.
+    /// What the titlebar says, so it is only set when it changes. The strip
+    /// paints no title, but the Window menu, Mission Control, the taskbar
+    /// and Waybar still read it.
     window_title: String,
+    /// The left button went down on the title strip and has not moved yet:
+    /// the first motion starts a window move.
+    pub strip_drag: bool,
+    /// A window frame to draw instead of asking the platform. The
+    /// window-harness tests pin one per layout: their window has no
+    /// compositor to ask.
+    pub chrome_pin: Option<crate::chrome::Frame>,
     /// The window's `rem` in pixels, read each frame. The mosaic is laid out
     /// in pixels, so its header band and label thresholds are scaled by this
     /// to follow interface zoom like the rest of the interface.
@@ -511,6 +520,8 @@ impl Disktree {
             confirm_focus: cx.focus_handle(),
             focus_request: None,
             window_title: String::new(),
+            strip_drag: false,
+            chrome_pin: None,
             rem: crate::ui::BASE_REM,
             run: None,
             run_epoch: 0,
@@ -3202,7 +3213,13 @@ impl Render for Disktree {
             window.set_window_title(&title);
             self.window_title = title;
         }
-        crate::views::root(self, window, cx)
+        let frame = self
+            .chrome_pin
+            .clone()
+            .unwrap_or_else(|| crate::chrome::Frame::detect(window, cx));
+        let root = crate::views::root(self, &frame, window, cx);
+        let theme = cx.omarchy().clone();
+        crate::chrome::client_frame(&frame, root, window, &theme)
     }
 }
 
