@@ -63,6 +63,20 @@ func run(_ executable: String, _ arguments: [String]) -> (status: Int32, output:
 
 // MARK: - Preconditions, before anything is written
 
+// The bundle's LSMinimumSystemVersion, which `cargo xtask bundle` compiles
+// the package for too, so both compiles make the same catalog. Read from
+// the template by hand: its placeholders keep it from parsing as a plist.
+let plistTemplate = macosDir.appendingPathComponent("Info.plist.in")
+guard let template = try? String(contentsOf: plistTemplate, encoding: .utf8),
+    let pattern = try? Regex(
+        #"<key>LSMinimumSystemVersion</key>\s*<string>([^<]+)</string>"#),
+    let match = template.firstMatch(of: pattern),
+    let version = match.output[1].substring
+else {
+    fail("cannot read LSMinimumSystemVersion from \(plistTemplate.path)")
+}
+let deploymentTarget = String(version)
+
 let os = ProcessInfo.processInfo.operatingSystemVersion
 guard os.majorVersion >= 26 else {
     fail("the glass icon is drawn by macOS 26 or later; this is \(os.majorVersion).\(os.minorVersion)")
@@ -184,7 +198,7 @@ func renderGlass() -> NSImage {
         "--enable-on-demand-resources", "NO",
         "--development-region", "en",
         "--target-device", "mac",
-        "--minimum-deployment-target", "11.0",
+        "--minimum-deployment-target", deploymentTarget,
         "--platform", "macosx",
     ])
     let catalog = compiled.appendingPathComponent("Assets.car")
