@@ -192,7 +192,7 @@ fn icon(svg: &Path, scratch: &Path, icns: &Path) -> Result<(), String> {
 }
 
 /// The token in the plist template that the catalog's keys replace. Left
-/// empty without a catalog, it is a blank line inside the dict.
+/// empty without a catalog, its line keeps only its indent.
 const ICON_CATALOG_MARKER: &str = "@ICON_CATALOG@";
 /// What macOS 26 reads the icon by: the name actool gave it in `Assets.car`.
 const ICON_CATALOG_KEYS: &str =
