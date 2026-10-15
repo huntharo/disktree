@@ -379,9 +379,16 @@ fn explore(
                 // pointer from here, wherever it goes in the window.
                 .on_drag_move(cx.listener(
                     |this, event: &DragMoveEvent<PanelDrag>, window, cx| {
+                        // The pointer is in window coordinates; the
+                        // panel's right edge is the content's, inset by a
+                        // client-side frame.
+                        let inset = &this.content_edges;
                         this.panel_rems = panel_width(
-                            event.event.position.x.as_f32(),
-                            window.viewport_size().width.as_f32(),
+                            (event.event.position.x - inset.left).as_f32(),
+                            (window.viewport_size().width
+                                - inset.left
+                                - inset.right)
+                                .as_f32(),
                             this.rem,
                         );
                         cx.notify();
@@ -468,12 +475,14 @@ fn title_strip(
             .items_center()
             .flex_1()
             .min_w_0()
-            .gap(space::LG)
             // Where you are is navigation, and it belongs to the whole window.
             .child(trail(app, &theme, cx))
+            // The space between the trail and the settings is all title
+            // bar: a gap there would look like it and not move the window.
             .child(
                 chrome::drag_area(frame, "strip-drag", cx)
                     .flex_1()
+                    .min_w(space::XXL)
                     .self_stretch(),
             )
             .child(view_settings(app, window, cx))
@@ -3264,16 +3273,22 @@ pub fn cursor_tooltip(
     let content = hover_tooltip(app, cx)?;
     let origin = app.treemap_origin.get();
     let window_size = window.bounds().size;
+    // The tooltip is placed in the root's coordinates, which a client-side
+    // frame insets from the window's by its resize ring and border.
+    let inset = &app.content_edges;
+    let content_width = (window_size.width - inset.left - inset.right).as_f32();
+    let content_height =
+        (window_size.height - inset.top - inset.bottom).as_f32();
 
     // Flip to the other side of the pointer rather than overflow the window.
-    let anchor_x = origin.x.as_f32() + pointer.x.as_f32();
-    let anchor_y = origin.y.as_f32() + pointer.y.as_f32();
-    let x = if anchor_x + gap + width > window_size.width.as_f32() {
+    let anchor_x = (origin.x + pointer.x - inset.left).as_f32();
+    let anchor_y = (origin.y + pointer.y - inset.top).as_f32();
+    let x = if anchor_x + gap + width > content_width {
         (anchor_x - gap - width).max(edge)
     } else {
         anchor_x + gap
     };
-    let y = if anchor_y + gap + height > window_size.height.as_f32() {
+    let y = if anchor_y + gap + height > content_height {
         (anchor_y - gap - height).max(edge)
     } else {
         anchor_y + gap
@@ -3281,6 +3296,7 @@ pub fn cursor_tooltip(
 
     Some(
         card_surface(cx)
+            .debug_selector(|| "cursor-tooltip".into())
             .absolute()
             .left(px(x))
             .top(px(y))

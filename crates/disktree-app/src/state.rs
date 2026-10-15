@@ -389,6 +389,10 @@ pub struct Disktree {
     /// window-harness tests pin one per layout: their window has no
     /// compositor to ask.
     pub chrome_pin: Option<crate::chrome::Frame>,
+    /// How far the content sits inside the window, from this frame's
+    /// [`crate::chrome::Frame`]: what turns a pointer position into one in
+    /// the root's coordinates.
+    pub content_edges: gpui_kit::Edges<Pixels>,
     /// The window's `rem` in pixels, read each frame. The mosaic is laid out
     /// in pixels, so its header band and label thresholds are scaled by this
     /// to follow interface zoom like the rest of the interface.
@@ -522,6 +526,7 @@ impl Disktree {
             window_title: String::new(),
             strip_drag: false,
             chrome_pin: None,
+            content_edges: gpui_kit::Edges::default(),
             rem: crate::ui::BASE_REM,
             run: None,
             run_epoch: 0,
@@ -3217,6 +3222,7 @@ impl Render for Disktree {
             .chrome_pin
             .clone()
             .unwrap_or_else(|| crate::chrome::Frame::detect(window, cx));
+        self.content_edges = frame.content_edges();
         let root = crate::views::root(self, &frame, window, cx);
         let theme = cx.omarchy().clone();
         crate::chrome::client_frame(&frame, root, window, &theme)

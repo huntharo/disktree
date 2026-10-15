@@ -1943,7 +1943,8 @@ fn the_title_strip_draws_on_every_window_frame(cx: &mut TestAppContext) {
 
             // The brand stays clear of the controls at either end.
             match &frame.leading {
-                Controls::None => assert!(brand.left() > strip.left()),
+                // The brand's area runs to the edge, padding and all.
+                Controls::None => assert_eq!(brand.left(), strip.left()),
                 Controls::Stoplights => assert!(
                     brand.left() - strip.left() >= chrome::STOPLIGHT_ZONE,
                     "{name}: brand at {:?}",
@@ -2082,4 +2083,36 @@ fn a_press_on_the_strip_arms_a_move_and_a_click_disarms_it(
         focus.is_focused(window)
     });
     assert!(focused, "a press on the strip leaves the treemap focused");
+}
+
+#[gpui_kit::test]
+fn the_tooltip_follows_the_pointer_inside_a_client_side_frame(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Floating under GNOME: the content sits inside the resize ring.
+    update(&view, cx, |app, cx| {
+        app.chrome_pin = window_frames()
+            .into_iter()
+            .find(|(name, _)| *name == "GNOME, controls right")
+            .map(|(_, frame)| frame);
+        cx.notify();
+    });
+    draw(cx);
+    let origin = read(&view, cx, |app| app.treemap_origin.get());
+    let at = origin + Point::new(px(40.), px(40.));
+    cx.simulate_mouse_move(at, None, gpui_kit::Modifiers::default());
+    draw(cx);
+
+    let tip = cx.debug_bounds("cursor-tooltip").expect("a tooltip");
+    // Beside the pointer by the tooltip's gap, wherever the root starts.
+    let gap = crate::ui::space::MD.0 * crate::ui::BASE_REM;
+    assert_eq!(
+        tip.left(),
+        at.x + px(gap),
+        "{tip:?} for a pointer at {at:?}"
+    );
+    assert_eq!(tip.top(), at.y + px(gap));
 }

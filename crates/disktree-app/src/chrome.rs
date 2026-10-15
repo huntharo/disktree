@@ -18,15 +18,16 @@ use std::sync::{Arc, LazyLock};
 
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, CursorStyle, Decorations, Div, FontWeight, Hsla,
-    Image, ImageFormat, InteractiveElement as _, IntoElement as _, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement as _, ResizeEdge, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Tiling, Window, WindowButton,
-    WindowButtonLayout, WindowControlArea, WindowControls, div, img, px, rgb,
-    svg, white,
+    AnyElement, Context, CursorStyle, Decorations, Div, Edges, FontWeight,
+    Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement as _,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels,
+    ResizeEdge, Stateful, StatefulInteractiveElement as _, Styled as _, Tiling,
+    Window, WindowButton, WindowButtonLayout, WindowControlArea,
+    WindowControls, div, img, px, rgb, svg, white,
 };
 use gpui_omarchy::{ActiveTheme as _, IconName, Theme};
 
+use crate::palette;
 use crate::state::Disktree;
 use crate::ui::{chrome, space};
 
@@ -163,6 +164,40 @@ impl Frame {
         }
     }
 
+    /// The ring kept on each side for the shadow and the resize grip: none
+    /// on a side the compositor has tiled, nor anywhere it draws the frame.
+    fn ring(&self) -> Edges<Pixels> {
+        let open = |tiled: bool| {
+            if tiled { px(0.) } else { chrome::RESIZE_RING }
+        };
+        self.client_side
+            .map_or_else(Edges::default, |tiling| Edges {
+                top: open(tiling.top),
+                right: open(tiling.right),
+                bottom: open(tiling.bottom),
+                left: open(tiling.left),
+            })
+    }
+
+    /// How far the content sits inside the window on each side: the ring,
+    /// then the hairline border, where disktree draws the frame. The
+    /// pointer and the window's size come in window coordinates, and
+    /// anything placed against them in the content has to take this off.
+    pub fn content_edges(&self) -> Edges<Pixels> {
+        let border = if self.client_side.is_some() {
+            px(1.)
+        } else {
+            px(0.)
+        };
+        let ring = self.ring();
+        Edges {
+            top: ring.top + border,
+            right: ring.right + border,
+            bottom: ring.bottom + border,
+            left: ring.left + border,
+        }
+    }
+
     /// Whether dragging the strip has to move the window by asking for it.
     /// Windows does it from the caption area it is told about, and a
     /// compositor that draws the frame has its own way to move a window.
@@ -198,8 +233,23 @@ pub fn strip(
     cx: &Context<'_, Disktree>,
 ) -> Stateful<Div> {
     let theme = cx.omarchy().clone();
-    let leading = controls(frame, &frame.leading, "leading", window, cx);
-    let trailing = controls(frame, &frame.trailing, "trailing", window, cx);
+    let maximized = window.is_maximized();
+    let leading = controls(
+        frame,
+        &frame.leading,
+        "window-controls-leading",
+        maximized,
+        &theme,
+        cx,
+    );
+    let trailing = controls(
+        frame,
+        &frame.trailing,
+        "window-controls-trailing",
+        maximized,
+        &theme,
+        cx,
+    );
     div()
         .id("title-strip")
         .debug_selector(|| "title-strip".into())
@@ -212,12 +262,21 @@ pub fn strip(
         .min_h(chrome::STRIP + px(1.))
         .border_b_1()
         .border_color(theme.divider())
-        .when(frame.leading == Controls::None, |strip| strip.pl(space::LG))
         .when(frame.trailing == Controls::None, |strip| strip.pr(space::LG))
         .children(leading)
+        // The brand's area takes the band's full height and the padding
+        // either side of it, so the strip has no dead margin around the
+        // mark that looks like title bar and does not move the window.
         .child(
             drag_area(frame, "strip-brand", cx)
+                .flex()
+                .items_center()
+                .self_stretch()
                 .flex_shrink_0()
+                .when(frame.leading == Controls::None, |area| {
+                    area.pl(space::LG)
+                })
+                .pr(space::LG)
                 .child(brand(wordmark, &theme)),
         )
         .child(
@@ -225,9 +284,9 @@ pub fn strip(
                 .flex()
                 .flex_row()
                 .items_center()
+                .self_stretch()
                 .flex_1()
                 .min_w_0()
-                .ml(space::LG)
                 .when(frame.trailing != Controls::None, |row| {
                     row.mr(space::SM)
                 })
@@ -279,6 +338,13 @@ pub fn drag_area(
         MouseButton::Left,
         cx.listener(|this, _, _, _| this.strip_drag = false),
     )
+    // Motion only reaches the area while the pointer is over it, so a
+    // press that leaves before its first motion is released elsewhere; it
+    // must not stay armed for the next drag that crosses the strip.
+    .on_mouse_up_out(
+        MouseButton::Left,
+        cx.listener(|this, _, _, _| this.strip_drag = false),
+    )
     .when(platform == Platform::Linux, |area| {
         area.on_mouse_down(MouseButton::Right, |event, window, _| {
             window.show_window_menu(event.position);
@@ -311,17 +377,11 @@ fn brand(wordmark: bool, theme: &Theme) -> Div {
 fn controls(
     frame: &Frame,
     controls: &Controls,
-    end: &'static str,
-    window: &Window,
+    selector: &'static str,
+    maximized: bool,
+    theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Option<AnyElement> {
-    let selector = if end == "leading" {
-        "window-controls-leading"
-    } else {
-        "window-controls-trailing"
-    };
-    let theme = cx.omarchy().clone();
-    let maximized = window.is_maximized();
     match controls {
         Controls::None => None,
         Controls::Stoplights => Some(
@@ -342,12 +402,12 @@ fn controls(
             let row =
                 if frame.platform == Platform::Windows {
                     row.children(buttons.iter().map(|&button| {
-                        caption_button(button, maximized, &theme)
+                        caption_button(button, maximized, theme)
                     }))
                 } else {
                     row.gap(space::SM).px(space::SM).children(
                         buttons.iter().map(|&button| {
-                            window_button(button, maximized, &theme)
+                            window_button(button, maximized, theme)
                         }),
                     )
                 };
@@ -401,8 +461,7 @@ fn window_button(
     theme: &Theme,
 ) -> Stateful<Div> {
     let group = button.id();
-    let rest = theme.foreground.opacity(0.08);
-    let hover = theme.foreground.opacity(0.16);
+    let (rest, hover) = palette::window_button(theme);
     div()
         .id(button.id())
         .group(group)
@@ -487,22 +546,27 @@ pub fn client_frame(
     theme: &Theme,
 ) -> AnyElement {
     let Some(tiling) = frame.client_side else {
+        // A compositor that takes the frame back takes the whole surface:
+        // an inset left over would draw its frame inside the shadow ring.
+        if window.client_inset().is_some_and(|inset| inset > px(0.)) {
+            window.set_client_inset(px(0.));
+        }
         return content.into_any_element();
     };
     let ring = chrome::RESIZE_RING;
     if window.client_inset() != Some(ring) {
         window.set_client_inset(ring);
     }
-    let open = |tiled: bool| if tiled { px(0.) } else { ring };
+    let open = frame.ring();
     let mut outer = div()
         .id("client-frame")
         .debug_selector(|| "client-frame".into())
         .relative()
         .size_full()
-        .pt(open(tiling.top))
-        .pb(open(tiling.bottom))
-        .pl(open(tiling.left))
-        .pr(open(tiling.right))
+        .pt(open.top)
+        .pb(open.bottom)
+        .pl(open.left)
+        .pr(open.right)
         .child(
             div()
                 .size_full()
@@ -511,13 +575,13 @@ pub fn client_frame(
                 .when(!tiling.is_tiled(), gpui_kit::Styled::shadow_lg)
                 .child(content),
         );
-    for (edge, sides) in [
-        (ResizeEdge::Top, [tiling.top]),
-        (ResizeEdge::Bottom, [tiling.bottom]),
-        (ResizeEdge::Left, [tiling.left]),
-        (ResizeEdge::Right, [tiling.right]),
+    for (edge, tiled) in [
+        (ResizeEdge::Top, tiling.top),
+        (ResizeEdge::Bottom, tiling.bottom),
+        (ResizeEdge::Left, tiling.left),
+        (ResizeEdge::Right, tiling.right),
     ] {
-        if !sides[0] {
+        if !tiled {
             outer = outer.child(grip(edge, ring));
         }
     }
@@ -535,7 +599,7 @@ pub fn client_frame(
 }
 
 /// One resize handle in the ring, with the cursor that says so.
-fn grip(edge: ResizeEdge, ring: gpui_kit::Pixels) -> Stateful<Div> {
+fn grip(edge: ResizeEdge, ring: Pixels) -> Stateful<Div> {
     let (cursor, id) = match edge {
         ResizeEdge::Top => (CursorStyle::ResizeUpDown, "grip-top"),
         ResizeEdge::Bottom => (CursorStyle::ResizeUpDown, "grip-bottom"),
