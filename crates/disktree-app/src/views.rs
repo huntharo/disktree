@@ -12,8 +12,8 @@ use disktree_core::tree::Metric;
 use gpui_kit::base::CheckboxState;
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
-    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
+    Focusable as _, FontWeight, InteractiveElement as _, IntoElement,
+    KeyDownEvent, MouseDownEvent, ParentElement, Rems, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
     pattern_slash, px, relative,
 };
@@ -43,6 +43,10 @@ pub fn root(
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Stateful<Div> {
+    if app.volumes_open {
+        app.prepare_picker_inputs(window, cx);
+    }
+    app.apply_focus(window, cx);
     let theme = cx.omarchy().clone();
     let body = match app.screen {
         Screen::Explore => explore(app, window, cx),
@@ -66,7 +70,7 @@ pub fn root(
         .on_action(cx.listener(
             |this, _: &crate::app_menu::OpenFolder, _, cx| {
                 if this.can_start_over() {
-                    Disktree::open_folder(cx);
+                    this.open_folder(cx);
                 }
             },
         ))
@@ -93,6 +97,11 @@ pub fn root(
                 cx.notify();
                 return;
             }
+            if this.volumes_open {
+                let editing = [&this.picker_host, &this.picker_path].into_iter()
+                    .flatten().any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+                if editing && event.keystroke.key != "escape" { return; }
+            }
             this.on_key_down(event, cx);
             this.apply_focus(window, cx);
         }))
@@ -112,7 +121,7 @@ pub fn root(
         root = root.child(help_overlay(app, cx));
     }
     if app.volumes_open {
-        root = root.child(volumes_dialog(app, cx));
+        root = root.child(volumes_dialog(app, window, cx));
     }
     if app.confirm_open {
         root = root.child(delete_dialog(app, cx));
@@ -120,42 +129,51 @@ pub fn root(
     root
 }
 
-/// Picking another volume scans it from scratch: the picker lists every
-/// volume with its free space, and the choice is the new root.
+/// Discovery is lightweight; a separate, explicit action starts the walk.
 fn volumes_dialog(
     app: &Disktree,
+    window: &Window,
     cx: &mut Context<'_, Disktree>,
 ) -> impl IntoElement {
     let theme = cx.omarchy().clone();
     let cancel = cx.entity().downgrade();
+    let source_ready = app.picker_source_matches(cx);
+    let source = app.volumes_source.as_ref().map_or_else(
+        || "This computer".to_owned(),
+        |host| format!("{host} · SSH · read-only"),
+    );
     let mut rows = div()
         .id("volume-rows")
         .debug_selector(|| "volume-rows".into())
         .flex()
         .flex_col()
-        .gap(space::XS);
+        .gap(space::XS)
+        .max_h(size::SOURCE_LIST_HEIGHT)
+        .overflow_y_scroll();
     if app.volumes_loading {
-        rows = rows.child(dialog_description("Looking for volumes…", cx));
+        rows = rows.child(dialog_description(
+            "Listing mounts, not scanning files…",
+            cx,
+        ));
+    } else if let Some(error) = &app.volumes_error {
+        rows = rows.child(div().text_color(theme.danger).child(error.clone()));
     } else if app.volumes.is_empty() {
-        rows = rows
-            .child(dialog_description("No other volume could be read.", cx));
+        rows = rows.child(dialog_description(
+            "No mounts listed. Enter a directory below.",
+            cx,
+        ));
     }
     for (index, volume) in app.volumes.iter().enumerate() {
         let highlighted = index == app.volume_highlight;
-        let free = volume.space.map_or_else(
-            || "unknown free".to_string(),
-            |space| format!("{} free", human_bytes(space.available)),
+        let label = format!(
+            "{}  ·  {}",
+            volume.point.display(),
+            volume.device.as_deref().unwrap_or("Mounted volume")
         );
-        let label = match &volume.device {
-            Some(device) => format!(
-                "{}  \u{00b7}  {device}  \u{00b7}  {free}",
-                volume.point.display()
-            ),
-            None => format!("{}  \u{00b7}  {free}", volume.point.display()),
-        };
         rows = rows.child(
             div()
                 .id(ElementId::Name(format!("volume-{index}").into()))
+                .debug_selector(move || format!("volume-{index}"))
                 .px(space::MD)
                 .py(space::SM)
                 .text_size(text::BODY)
@@ -164,25 +182,71 @@ fn volumes_dialog(
                 } else {
                     theme.foreground
                 })
-                // Only the row the keys are on is tinted: a second highlight
-                // would read as a second selection.
                 .when(highlighted, |row| row.bg(theme.accent.opacity(0.18)))
                 .hover(|row| row.bg(theme.accent.opacity(0.1)))
                 .child(label)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.volume_highlight = index;
-                    this.choose_volume(cx);
-                    window.focus(&this.focus, cx);
+                    window.focus(&this.confirm_focus, cx);
+                    cx.notify();
                 })),
         );
     }
-    let popup = dialog_popup(cx)
-        .child(dialog_title("Scan a volume", cx))
+    let host = app
+        .picker_host
+        .as_ref()
+        .expect("picker prepared before rendering");
+    let path = app
+        .picker_path
+        .as_ref()
+        .expect("picker prepared before rendering");
+    let popup = dialog_popup(cx).w_full()
+        .child(dialog_title("Choose what to scan", cx))
         .child(dialog_description(
-            "Up and down moves, Enter scans it, Escape stays here.",
-            cx,
+            "Connect, then select a mount or directory. No new scan starts until you choose Scan.",
+            cx))
+        .child(div().flex().flex_row().gap(space::SM)
+            .child(button("source-local", "This computer", ButtonVariant::Secondary, cx)
+                .on_click(cx.listener(|this, _, window, cx| this.choose_local_source(window, cx))))
+            .child(gpui_omarchy::input("source-host", host, window, cx)
+                .debug_selector(|| "source-host".into()).flex_1())
+            .child(button("source-connect", "Connect SSH", ButtonVariant::Secondary, cx)
+                .on_click(cx.listener(|this, _, _, cx| this.connect_picker(cx)))))
+        .child(div().text_color(theme.bright).child(source))
+        .child(rows)
+        .child(dialog_description(
+            "Nested mounts and symlinks are not traversed. Space is measured only after selection.", cx))
+        .child(div().flex().flex_row().gap(space::SM)
+            .child(gpui_omarchy::input("source-path", path, window, cx)
+                .debug_selector(|| "source-path".into()).flex_1())
+            .child(button("source-scan-path", "Scan directory", ButtonVariant::Secondary, cx)
+                .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some())
+                .on_click(cx.listener(|this, _, _, cx| this.choose_picker_path(cx)))))
+        .children(app.picker_error.as_ref().map(|error| div().text_color(theme.danger).child(error.clone())))
+        .child(div().flex().flex_row().justify_end().gap(space::SM)
+            .child(dialog_button("source-cancel", "Cancel", ButtonVariant::Secondary, cx)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.close_volumes(cx); this.apply_focus(window, cx);
+                })))
+            .child(dialog_button("source-scan", "Scan selected root", ButtonVariant::Primary, cx)
+                .disabled(!source_ready || app.volumes_loading || app.volumes_error.is_some() || app.volumes.is_empty())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.choose_volume(cx); this.apply_focus(window, cx);
+                }))));
+    let popup = div()
+        .id("source-picker-scroll")
+        .debug_selector(|| "source-picker".into())
+        .w(size::SOURCE_PICKER)
+        .max_w(Rems(
+            window.viewport_size().width.as_f32() / app.rem
+                * size::SOURCE_VIEWPORT_FRACTION,
         ))
-        .child(rows);
+        .max_h(Rems(
+            window.viewport_size().height.as_f32() / app.rem
+                * size::SOURCE_VIEWPORT_FRACTION,
+        ))
+        .overflow_y_scroll()
+        .child(popup);
     let centred = centred_popup(popup, {
         let close = cancel.clone();
         move |_, window, cx| {
@@ -197,7 +261,23 @@ fn volumes_dialog(
         .open(true)
         .on_ok(move |_, window, cx| {
             let _ = accept.update(cx, |this, cx| {
-                this.choose_volume(cx);
+                let host_focused =
+                    this.picker_host.as_ref().is_some_and(|input| {
+                        input.read(cx).focus_handle(cx).is_focused(window)
+                    });
+                let path_focused =
+                    this.picker_path.as_ref().is_some_and(|input| {
+                        input.read(cx).focus_handle(cx).is_focused(window)
+                    });
+                if this.volumes_open {
+                    if host_focused {
+                        this.connect_picker(cx);
+                    } else if path_focused {
+                        this.choose_picker_path(cx);
+                    } else {
+                        this.choose_volume(cx);
+                    }
+                }
                 this.apply_focus(window, cx);
             });
             false
@@ -342,11 +422,45 @@ fn explore(
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
     let theme = cx.omarchy().clone();
+    if app.awaiting_root {
+        return div()
+            .debug_selector(|| "choose-root-idle".into())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap(space::LG)
+            .p(space::XXL)
+            .child(
+                div()
+                    .text_size(text::HEADING)
+                    .child("Choose a source. Then choose a root."),
+            )
+            .child(div().text_color(theme.secondary).child(
+                "Local or SSH · one mount at a time · no background scan",
+            ))
+            .child(
+                button(
+                    "choose-source",
+                    "Choose source…",
+                    ButtonVariant::Primary,
+                    cx,
+                )
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.open_volumes(cx);
+                        this.apply_focus(window, cx);
+                    },
+                )),
+            );
+    }
     let mosaic: Mosaic = app.prepare();
     let width_rems = window.viewport_size().width.as_f32() / app.rem;
     // The panel is where the selection, the marks and the disk live; it
     // only gives way when the mosaic would be too narrow to read.
-    let panel = app.show_selection && width_rems >= PANEL_SHOWN_REMS;
+    let panel = (app.show_selection || app.is_indexing())
+        && width_rems >= PANEL_SHOWN_REMS;
     if panel && let Some(path) = selection_checkout(app) {
         app.ensure_git(&path, cx);
     }
@@ -354,7 +468,13 @@ fn explore(
     let viewport = if app.tree().is_none() {
         // The first walk of a home directory takes long enough that an
         // empty viewport would look broken; count the work instead.
-        scanning_panel(app, &theme, cx).into_any_element()
+        if app.scan_error.is_none()
+            && let Some(preview) = &app.scan_preview
+        {
+            treemap_view::preview(preview, app, window, cx).into_any_element()
+        } else {
+            scanning_panel(app, &theme, cx).into_any_element()
+        }
     } else {
         treemap_view::mosaic(mosaic, app, window, cx).into_any_element()
     };
@@ -404,11 +524,20 @@ fn explore(
                 )
                 .children(panel.then(|| side_panel(app, &theme, cx))),
         )
+        .children((app.is_indexing() && !panel).then(|| {
+            div()
+                .px(space::LG)
+                .py(space::SM)
+                .child(indexing_compact(app, &theme, cx))
+        }))
         .child(key_bar(app, &theme, cx))
 }
 
 /// The selection, when it is a checkout git can say something about.
 fn selection_checkout(app: &Disktree) -> Option<std::path::PathBuf> {
+    if app.remote.is_some() {
+        return None;
+    }
     let target = app.action_target()?;
     let node = app.node_at(&target)?;
     if !node.is_dir() {
@@ -457,7 +586,14 @@ fn top_bar(
         .py(space::MD)
         .border_b_1()
         .border_color(theme.divider())
-        .child(logo(theme))
+        .child(with_tooltip(
+            logo(theme).id("choose-source").cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_volumes(cx);
+                    this.apply_focus(window, cx);
+                })),
+            "Choose local or SSH source · v",
+        ))
         // Where you are is navigation, and it belongs to the whole window.
         .child(trail(app, theme, cx))
         .child(div().flex_1())
@@ -1209,6 +1345,12 @@ fn trail_and_legend(
 /// What the whole scan found, as one quiet line; unreadable paths are
 /// flagged in the warning colour when there are any.
 fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
+    if app.is_indexing() {
+        return div()
+            .text_size(text::CAPTION)
+            .text_color(theme.secondary)
+            .child("Live overview · incomplete · top-level contributions");
+    }
     let tree = app.tree();
     let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
     let files = tree.map_or(app.progress.files, |node| node.files);
@@ -1331,7 +1473,9 @@ fn side_panel(
         .border_color(theme.divider())
         .bg(theme.surface)
         .child(handle)
-        .child(selection_section(app, theme, cx))
+        .child(if app.is_indexing() {
+            indexing_progress(app, theme, cx)
+        } else { selection_section(app, theme, cx) })
         .child(rule())
         // The lists scroll; the selection above and the disk below stay put,
         // so the two numbers that matter never leave the screen.
@@ -1459,7 +1603,8 @@ fn selection_section(
         ))
         .child(widgets::bar(share, highlight, cx));
 
-    let fourth = if node.is_dir()
+    let fourth = if app.remote.is_none()
+        && node.is_dir()
         && let Some(path) = &path
         && crate::git::is_checkout(path)
     {
@@ -2091,7 +2236,11 @@ fn administrator_line(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Option<Div> {
-    if app.administrator != Some(false) || app.restarting || app.run.is_some() {
+    if app.remote.is_some()
+        || app.administrator != Some(false)
+        || app.restarting
+        || app.run.is_some()
+    {
         return None;
     }
     let errors = app.progress.errors;
@@ -2175,7 +2324,7 @@ fn disk_section(
         )
         .child(div().flex_1())
         .child(
-            button("volumes", "Volumes", ButtonVariant::Secondary, cx)
+            button("volumes", "Source…", ButtonVariant::Secondary, cx)
                 .tab_stop(false)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.open_volumes(cx);
@@ -2406,12 +2555,8 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
                 .child(format!("{:.1}\u{00d7}", app.view.scale)),
         );
     }
-    let scan = if app.scan.is_some() {
-        format!(
-            "scanning \u{00b7} {} entries \u{00b7} {}",
-            widgets::human_count(app.progress.files),
-            human_bytes(app.progress.bytes)
-        )
+    let scan = if app.scan.is_some() || app.remote_scan.is_some() {
+        "Indexing · incomplete".to_string()
     } else if app.progress.cancelled {
         format!(
             "scan cancelled \u{00b7} {} entries \u{00b7} r scans again",
@@ -2442,109 +2587,211 @@ fn scanning_panel(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
-    let progress = &app.progress;
-    let cancelled = app.scan.is_none() && progress.cancelled;
-    let mut panel = div()
+    let error = app.scan_error.as_ref();
+    div()
+        .debug_selector(move || {
+            if error.is_some() {
+                "scan-error"
+            } else {
+                "scan-reading"
+            }
+            .into()
+        })
         .flex()
         .flex_col()
         .flex_1()
         .min_h_0()
-        .items_center()
-        .justify_center()
-        .gap(space::LG)
+        .items_start()
+        .justify_start()
+        .p(space::XL)
+        .gap(space::MD)
         .bg(theme.inset)
-        .when(!cancelled, |panel| {
+        .text_size(text::BODY)
+        .text_color(theme.secondary)
+        .child(if error.is_some() {
+            "Scan failed"
+        } else if app.progress.cancelled {
+            "Indexing stopped"
+        } else {
+            "Waiting for the first indexed entries…"
+        })
+        .children(error.map(|error| {
+            div()
+                .max_w(size::HELP)
+                .text_color(theme.danger)
+                .child(error.clone())
+        }))
+        .when(!app.is_indexing(), |panel| {
             panel.child(
-                gpui_omarchy::icon(gpui_omarchy::IconName::Loader)
-                    .size(icon::LG)
-                    .text_color(theme.accent),
+                button("scan-again", "Scan again", ButtonVariant::Outline, cx)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_scan(cx);
+                        window.focus(&this.focus, cx);
+                    })),
             )
         })
+}
+
+/// Narrow windows retain the essential counters in a compact footer.
+fn indexing_compact(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    div()
+        .debug_selector(|| "indexing-compact".into())
+        .flex()
+        .items_center()
+        .gap(space::MD)
+        .min_w_0()
+        .text_size(text::BODY)
         .child(
             div()
-                .text_size(text::TITLE)
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.bright)
-                .child(if cancelled {
-                    format!("Stopped reading {}", widgets::display_root(app))
-                } else {
-                    format!("Reading {}", widgets::display_root(app))
-                }),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap(space::XL)
-                .child(widgets::stat(
-                    "files",
-                    widgets::human_count(progress.files),
-                    cx,
-                ))
-                .child(widgets::stat("directories", widgets::human_count(progress.dirs), cx))
-                .child(widgets::stat("measured", human_bytes(progress.bytes), cx))
-                .child(widgets::stat_colored(
-                    "unreadable",
-                    widgets::human_count(progress.errors),
-                    if progress.errors > 0 {
-                        theme.warning
-                    } else {
-                        theme.secondary
-                    },
-                    cx,
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(theme.mono_font.clone())
+                .child(format!(
+                    "{} files",
+                    widgets::human_count(app.progress.files)
                 )),
         )
-        .when(!cancelled, |panel| {
-            panel.child(
-                div()
-                    .w(size::SCANNING_METER)
-                    .child(widgets::meter_row(
-                        "",
-                        "",
-                        progress_estimate(progress.files),
-                        theme.accent,
-                        cx,
-                    )),
-            )
-        })
         .child(
             div()
-                .text_size(text::BODY)
-                .text_color(theme.secondary)
-                .child(if cancelled {
-                    "Nothing is shown from a scan that did not finish."
-                } else {
-                    "Marking, zooming and the free-space meter all work as soon as it lands."
-                }),
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(theme.mono_font.clone())
+                .child(format!("{} measured", human_bytes(app.progress.bytes))),
         )
-        // A failed scan has nothing left to cancel either.
-        .child(if app.scan.is_none() {
-            button("scan-again", "Scan again", ButtonVariant::Outline, cx)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.start_scan(cx);
+        .child(
+            button("cancel-scan", "Stop", ButtonVariant::Outline, cx).on_click(
+                cx.listener(|this, _, window, cx| {
+                    this.cancel_scan(cx);
                     window.focus(&this.focus, cx);
-                }))
-        } else {
-            button("cancel-scan", "Cancel", ButtonVariant::Outline, cx)
+                }),
+            ),
+        )
+}
+
+/// Progress has one owner. Stable rows and mono values prevent digit,
+// unit and path changes from pushing the rest of the screen around.
+fn indexing_progress(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let elapsed = app.scan_started.map_or(0, |at| at.elapsed().as_secs());
+    let row = |label: &'static str, value: String, id: &'static str| {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(size::PROGRESS_ROW)
+            .child(div().text_color(theme.secondary).child(label))
+            .child(
+                div()
+                    .debug_selector(move || id.into())
+                    .w(size::PROGRESS_VALUE)
+                    .text_right()
+                    .font_family(theme.mono_font.clone())
+                    .child(value),
+            )
+    };
+    let path = if app.remote.is_some() {
+        app.remote_progress.directory.as_ref()
+    } else {
+        app.scan_preview
+            .as_ref()
+            .and_then(|preview| preview.directory.as_ref())
+    };
+    let full_path = path.map_or_else(
+        || "Directory not reported yet".into(),
+        |path| path.display().to_string(),
+    );
+    let mut parts = path
+        .map(|path| {
+            path.components()
+                .rev()
+                .take(3)
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    parts.reverse();
+    let short_path = if path.is_some_and(|path| path.components().count() > 3) {
+        format!("…/{}", parts.join("/"))
+    } else {
+        full_path.clone()
+    };
+    div()
+        .debug_selector(|| "indexing-progress".into())
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .gap(space::XS)
+        .text_size(text::BODY)
+        .text_color(theme.foreground)
+        .child(widgets::eyebrow("Indexing", cx))
+        .child(div().h(size::PROGRESS_ROW).truncate().child(
+            if app.remote.is_some() {
+                app.remote_progress.stage.label()
+            } else {
+                "Reading this computer"
+            },
+        ))
+        .child(row(
+            "Files",
+            widgets::human_count(app.progress.files),
+            "indexing-files",
+        ))
+        .child(row(
+            "Directories",
+            widgets::human_count(app.progress.dirs),
+            "indexing-dirs",
+        ))
+        .child(row(
+            "Measured",
+            human_bytes(app.progress.bytes),
+            "indexing-bytes",
+        ))
+        .child(row(
+            "Read errors",
+            widgets::human_count(app.progress.errors),
+            "indexing-errors",
+        ))
+        .child(row("Elapsed", format!("{elapsed} s"), "indexing-elapsed"))
+        .child(
+            div()
+                .h(size::PROGRESS_ROW)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child("Recent directory"),
+        )
+        .child(with_tooltip(
+            div()
+                .id("indexing-directory")
+                .debug_selector(|| "scan-directory".into())
+                .h(size::PROGRESS_ROW)
+                .min_w_0()
+                .truncate()
+                .font_family(theme.mono_font.clone())
+                .child(short_path),
+            full_path,
+        ))
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child("Preview only · provisional totals"),
+        )
+        .child(
+            button("cancel-scan", "Stop indexing", ButtonVariant::Outline, cx)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.cancel_scan(cx);
                     window.focus(&this.focus, cx);
-                }))
-        });
-
-    if let Some(error) = &app.scan_error {
-        panel = panel.child(
-            div()
-                .max_w(size::HELP)
-                .p(space::MD)
-                .border_1()
-                .border_color(theme.danger)
-                .text_color(theme.danger)
-                .text_size(text::BODY)
-                .child(error.clone()),
-        );
-    }
-    panel
+                })),
+        )
 }
 
 fn find_field(app: &Disktree, theme: &Theme) -> Div {
@@ -2648,18 +2895,6 @@ fn marks_ancestor(
         .filter(|item| item.path != path && path.starts_with(&item.path))
         .map(|item| short_name(&item.path))
         .next()
-}
-
-/// A scan has no total to measure against, so the meter shows the work done
-/// rather than pretending to know how far along it is.
-fn progress_estimate(files: u64) -> f32 {
-    if files == 0 {
-        0.06
-    } else {
-        // Asymptotic: the bar keeps moving while the walk continues.
-        let scaled = files as f32 / (files as f32 + 20_000.0);
-        (0.1 + scaled * 0.85).min(0.99)
-    }
 }
 
 // ── review ──────────────────────────────────────────────────────────────
@@ -2891,13 +3126,20 @@ fn review_summary(
         cx,
     );
 
-    let explanation = match app.removal_mode {
-        RemovalMode::Trash => format!(
-            "Recoverable from the trash until it is emptied. Uses {}.",
-            app.trash_backend.label()
-        ),
-        RemovalMode::Permanent => {
-            "Deleted at once, like rm -rf. Nothing is recoverable.".to_string()
+    let explanation = if app.remote.is_some() {
+        "Read-only SSH session. Export the selection; nothing is \
+         deleted here. Free space is sampled at scan time."
+            .to_string()
+    } else {
+        match app.removal_mode {
+            RemovalMode::Trash => format!(
+                "Recoverable from the trash until it is emptied. Uses {}.",
+                app.trash_backend.label()
+            ),
+            RemovalMode::Permanent => {
+                "Deleted at once, like rm -rf. Nothing is recoverable."
+                    .to_string()
+            }
         }
     };
 
@@ -2917,7 +3159,7 @@ fn review_summary(
                 .flex_col()
                 .gap(space::SM)
                 .child(widgets::section("What happens", cx))
-                .child(mode)
+                .children(app.remote.is_none().then_some(mode))
                 .child(
                     div()
                         .text_size(text::CAPTION)
@@ -2998,7 +3240,7 @@ fn review_summary(
         .child(div().flex_1())
         .children(notice_line(app, theme, cx))
         .child(export_controls(plan, cx))
-        .child(commit_controls(app, plan, cx))
+        .children(app.remote.is_none().then(|| commit_controls(app, plan, cx)))
 }
 
 /// The list handed on instead of acted on: saved as paths, or copied as a
@@ -3009,7 +3251,7 @@ fn export_controls(
 ) -> Div {
     div()
         .flex()
-        .flex_row()
+        .flex_col()
         .justify_end()
         .gap(space::SM)
         .child(
@@ -3034,6 +3276,30 @@ fn export_controls(
             .disabled(plan.is_empty())
             .on_click(cx.listener(|this, _, _, cx| {
                 this.copy_agent_prompt(cx);
+            })),
+        )
+        .child(
+            button(
+                "save-script",
+                "Save delete script…",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .disabled(plan.is_empty())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.save_delete_script(cx);
+            })),
+        )
+        .child(
+            button(
+                "copy-script",
+                "Copy delete script",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .disabled(plan.is_empty())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.copy_delete_script(cx);
             })),
         )
 }
@@ -3100,9 +3366,23 @@ fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .py(space::SM)
         .border_t_1()
         .border_color(theme.divider())
-        .child(widgets::hint("enter", commit, cx))
-        .child(widgets::hint("m", "trash", cx))
-        .child(widgets::hint("p", "permanent", cx))
+        .children(
+            app.remote
+                .is_none()
+                .then(|| widgets::hint("enter", commit, cx)),
+        )
+        .children(
+            app.remote
+                .is_none()
+                .then(|| widgets::hint("m", "trash", cx)),
+        )
+        .children(
+            app.remote
+                .is_none()
+                .then(|| widgets::hint("p", "permanent", cx)),
+        )
+        .child(widgets::hint("e", "save script", cx))
+        .child(widgets::hint("y", "copy script", cx))
         .child(widgets::hint("!", "unmark all", cx))
         .child(widgets::hint("s", "save list", cx))
         .child(widgets::hint("a", "copy as prompt", cx))
@@ -3332,7 +3612,7 @@ fn done(app: &Disktree, cx: &gpui_kit::Context<'_, Disktree>) -> Div {
         body = body.child(widgets::meter_row(
             "re-scanning",
             format!("{} files", widgets::human_count(app.progress.files)),
-            progress_estimate(app.progress.files),
+            0.0,
             theme.accent,
             cx,
         ));

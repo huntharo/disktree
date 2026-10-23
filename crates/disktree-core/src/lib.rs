@@ -7,16 +7,24 @@
 
 pub mod access;
 pub mod classify;
+pub mod deployment;
 pub mod export;
 pub mod filter;
+pub mod identity;
 pub mod insights;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod macos_services;
 #[cfg(windows)]
 mod mft;
+pub mod payload;
+pub mod remote;
+pub mod remote_progress;
+#[cfg(unix)]
+mod remote_walk;
 pub mod removal;
 pub mod scan;
+pub mod scan_preview;
 pub mod scan_threads;
 pub mod size;
 pub mod space;

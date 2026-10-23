@@ -61,12 +61,12 @@ impl Marks {
 
     /// Re-read sizes from a freshly scanned tree and drop marks whose path no
     /// longer exists, so the tally never claims space that is already gone.
-    pub fn refresh(&mut self, root_path: &Path, root: &Node, metric: Metric) {
+    pub fn refresh(&mut self, root_path: &Path, root: &Node, _metric: Metric) {
         let mut resolved = Vec::with_capacity(self.items.len());
         for item in &self.items {
             match find(root_path, root, &item.path) {
                 Some(node) => resolved.push(Target {
-                    bytes: node.value(metric),
+                    bytes: node.bytes,
                     is_dir: node.is_dir(),
                     hidden: is_hidden(&item.path),
                     path: item.path.clone(),

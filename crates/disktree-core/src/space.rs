@@ -8,7 +8,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// A volume's capacity in bytes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct SpaceInfo {
     /// Total size of the volume.
     pub total: u64,
@@ -97,8 +106,7 @@ pub fn device_in(table: &str, path: &Path) -> Option<String> {
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let device = fields.next()?;
-            // Spaces in mount points are escaped as \040.
-            let mount = fields.next()?.replace("\\040", " ");
+            let mount = unescape_octal(fields.next()?);
             path.starts_with(&mount)
                 .then(|| (mount.len(), device.to_string()))
         })
@@ -123,8 +131,7 @@ pub fn parse_mounts(table: &str) -> Vec<Mount> {
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let source = fields.next()?.to_string();
-            // Spaces in mount points are escaped as \040.
-            let point = PathBuf::from(fields.next()?.replace("\\040", " "));
+            let point = PathBuf::from(unescape_octal(fields.next()?));
             let fstype = fields.next()?.to_string();
             let options = fields.next().unwrap_or_default().to_string();
             Some(Mount {
@@ -378,6 +385,46 @@ pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
 #[cfg(windows)]
 pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
     crate::windows::volume_root(path)
+}
+
+/// Every nested mount is a scan boundary, including bind mounts and
+/// same-device subvolumes. Selecting a mount explicitly makes it a root.
+pub fn mount_boundaries(mounts: &[Mount], root: &Path) -> Vec<PathBuf> {
+    mounts
+        .iter()
+        .filter(|mount| mount.point != root && mount.point.starts_with(root))
+        .map(|mount| mount.point.clone())
+        .collect()
+}
+
+/// Boundaries from this machine's own mount namespace.
+pub fn mount_boundaries_for(root: &Path) -> Option<Vec<PathBuf>> {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Some(mount_boundaries(&mount_table()?, root))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("mount").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(
+            parse_macos_mounts(&String::from_utf8_lossy(&output.stdout))
+                .into_iter()
+                .filter(|point| point != root && point.starts_with(root))
+                .collect(),
+        )
+    }
+    #[cfg(windows)]
+    {
+        Some(
+            crate::windows::mount_points()
+                .into_iter()
+                .filter(|point| point != root && point.starts_with(root))
+                .collect(),
+        )
+    }
 }
 
 /// [`foreign_mounts`] for this machine; `None` when the mount table cannot
@@ -703,7 +750,7 @@ pub const fn foreign_mounts_for(_root: &Path) -> Option<Vec<PathBuf>> {
 
 /// A mounted volume the picker can switch the scan to: where it is mounted
 /// and how much room it has. Listed by [`volumes`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Volume {
     /// Where the volume is mounted: `C:\` on Windows, `/` or `/home` on
     /// Linux, `/` on macOS.
@@ -720,9 +767,8 @@ pub struct Volume {
 /// Pseudo filesystems (`/proc`, `/sys`, tmpfs, …), snapshot subvolumes and
 /// automount points are left out: switching the scan to one of those would
 /// measure the wrong thing, the same reason [`foreign_mounts`] keeps a scan
-/// from entering them. Duplicates from one device mounted twice (a btrfs
-/// subvolume at `/` and `/home`) collapse to the shortest mount point, which
-/// is the top of that disk.
+/// from entering them. Same-device mounts remain individually selectable:
+/// a scan no longer crosses into another mount implicitly.
 #[cfg(not(any(target_os = "macos", windows)))]
 pub fn volumes() -> Vec<Volume> {
     let Ok(table) = std::fs::read_to_string("/proc/self/mounts") else {
@@ -731,22 +777,54 @@ pub fn volumes() -> Vec<Volume> {
     volumes_in(&parse_mounts(&table))
 }
 
-/// [`volumes`] over a given mount table, for testing.
-pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
+/// Read root candidates without opening them, measuring free space, or
+/// touching network mounts. Discovery is not permission to start scanning.
+pub fn volume_roots() -> io::Result<Vec<Volume>> {
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let mounts = mount_table()
+            .ok_or_else(|| io::Error::other("cannot read mount table"))?;
+        Ok(volume_roots_in(&mounts))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("mount").output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("cannot list mounted volumes"));
+        }
+        Ok(parse_macos_mounts(&String::from_utf8_lossy(&output.stdout))
+            .into_iter()
+            .filter(|point| point.as_os_str() != MACOS_DATA_VOLUME)
+            .map(|point| Volume {
+                point,
+                device: None,
+                space: None,
+            })
+            .collect())
+    }
+    #[cfg(windows)]
+    {
+        Ok(crate::windows::mount_points()
+            .into_iter()
+            .map(|point| Volume {
+                point,
+                device: None,
+                space: None,
+            })
+            .collect())
+    }
+}
+
+/// Root candidates from a mount table; deliberately never calls statvfs.
+pub fn volume_roots_in(mounts: &[Mount]) -> Vec<Volume> {
     let mut seen: Vec<&Mount> = Vec::new();
     for mount in mounts {
         if !is_volume_candidate(mount) {
             continue;
         }
-        // One device mounted twice (a btrfs disk at `/`, `/home`,
-        // `/var/log`) is one volume: keep the shortest mount point, which is
-        // the top of that disk.
-        if let Some(known) = seen.iter_mut().find(|known| {
-            known.source == mount.source && known.fstype == mount.fstype
-        }) {
-            if mount.point.as_os_str().len() < known.point.as_os_str().len() {
-                *known = mount;
-            }
+        // Nested mounts are not traversed. Even mounts sharing a device
+        // must remain individually selectable; only overmounts collapse.
+        if seen.iter().any(|known| known.point == mount.point) {
             continue;
         }
         seen.push(mount);
@@ -756,11 +834,19 @@ pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
         .map(|mount| Volume {
             point: mount.point.clone(),
             device: Some(mount.source.clone()),
-            space: space_info(&mount.point).ok(),
+            space: None,
         })
         .collect();
-    // The scarcest room is the most interesting to a cleanup tool, so the
-    // fullest volume that still reads is first; unreadable ones sort last.
+    volumes.sort_by(|left, right| left.point.cmp(&right.point));
+    volumes
+}
+
+/// [`volumes`] over a given mount table, for testing.
+pub fn volumes_in(mounts: &[Mount]) -> Vec<Volume> {
+    let mut volumes = volume_roots_in(mounts);
+    for volume in &mut volumes {
+        volume.space = space_info(&volume.point).ok();
+    }
     sort_by_free_space(&mut volumes);
     volumes
 }
@@ -1034,6 +1120,39 @@ portal /run/user/1000/doc fuse.portal rw 0 0
     }
 
     #[test]
+    fn discovery_candidates_do_not_probe_unavailable_mounts() {
+        let table = parse_mounts(
+            "/dev/root /not-present-disktree-root ext4 rw 0 0\n\
+             /dev/root /not-present-disktree-bind ext4 rw 0 0\n\
+             server:/share /unreachable-disktree-network nfs rw 0 0\n\
+             systemd-1 /untriggered-disktree-autofs autofs rw 0 0\n",
+        );
+        let volumes = volume_roots_in(&table);
+        assert_eq!(volumes.len(), 3);
+        assert!(volumes.iter().all(|volume| volume.space.is_none()));
+        assert!(
+            !volumes.iter().any(|volume| volume.point
+                == Path::new("/untriggered-disktree-autofs"))
+        );
+    }
+
+    #[test]
+    fn strict_scan_boundaries_include_same_device_and_bind_mounts() {
+        let mounts = parse_mounts(
+            "/dev/root / btrfs rw 0 0\n\
+             /dev/root /home btrfs rw,subvol=@home 0 0\n\
+             /dev/root /bind btrfs rw 0 0\n\
+             /dev/other /external ext4 rw 0 0\n",
+        );
+        let boundaries = mount_boundaries(&mounts, Path::new("/"));
+        assert_eq!(
+            boundaries,
+            ["/home", "/bind", "/external"].map(PathBuf::from)
+        );
+        assert!(mount_boundaries(&mounts, Path::new("/home")).is_empty());
+    }
+
+    #[test]
     fn a_volume_includes_its_subvolumes_and_nothing_else() {
         let mounts = parse_mounts(OMARCHY);
         let mut foreign = foreign_mounts(&mounts, Path::new("/"));
@@ -1060,11 +1179,12 @@ portal /run/user/1000/doc fuse.portal rw 0 0
             .iter()
             .map(|volume| volume.point.clone())
             .collect();
-        // One btrfs disk (at `/`, collapsing `/home` and `/var/log`), plus
-        // the boot disk; tmpfs, autofs, portals and snapshots are not scans.
+        // Same-device subvolumes stay selectable because a scan of the
+        // parent now stops at their mount boundaries.
         assert!(points.contains(&PathBuf::from("/")), "{points:?}");
         assert!(points.contains(&PathBuf::from("/boot")), "{points:?}");
-        assert_eq!(points.len(), 2, "{points:?}");
+        assert!(points.contains(&PathBuf::from("/home")), "{points:?}");
+        assert!(points.contains(&PathBuf::from("/var/log")), "{points:?}");
     }
 
     #[test]
