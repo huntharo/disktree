@@ -20,20 +20,19 @@ use crate::tree::{Node, NodeKind, aggregate};
 use std::time::Instant;
 
 const VERSION: u32 = 1;
+const MAX_LINE: u64 = 1 << 20;
+const MAX_DIAGNOSTICS: usize = 16 << 10;
 
 /// Whether `path` names a directory from the remote host's root.
 ///
-/// The SSH helper is Unix-only, so remote paths are always `/`-rooted.
-/// `Path::is_absolute` also wants a drive letter on Windows, which would
-/// reject every remote path a Windows client receives. On Unix the two
-/// checks agree.
+/// The SSH helper is Unix-only, so remote paths are `/`-rooted.
+/// `Path::is_absolute` also wants a drive letter on Windows, and
+/// `Path::has_root` accepts `\x` and `C:\x` there, so neither works for a
+/// Windows client. On Unix this agrees with `is_absolute`.
 #[must_use]
 pub fn is_remote_absolute(path: &Path) -> bool {
-    path.has_root()
+    path.as_os_str().as_encoded_bytes().first() == Some(&b'/')
 }
-
-const MAX_LINE: u64 = 1 << 20;
-const MAX_DIAGNOSTICS: usize = 16 << 10;
 
 // Non-interactive shells often omit ~/.local/bin. Do not require users to
 // edit the server's startup files after the documented user-local install.
@@ -1111,6 +1110,10 @@ mod tests {
         assert!(is_remote_absolute(Path::new("/home/someone")));
         assert!(!is_remote_absolute(Path::new("home/someone")));
         assert!(!is_remote_absolute(Path::new("")));
+        // Windows-rooted paths name nothing on a Unix host.
+        assert!(!is_remote_absolute(Path::new(r"\home\someone")));
+        assert!(!is_remote_absolute(Path::new(r"C:\Users")));
+        assert!(!is_remote_absolute(Path::new(r"\\server\share")));
     }
 
     #[test]
