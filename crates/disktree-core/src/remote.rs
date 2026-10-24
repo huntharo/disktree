@@ -1210,18 +1210,25 @@ mod tests {
                     .unwrap();
             assert_eq!(snapshot.tree.bytes, if dedup { 10 } else { 15 });
             assert_eq!(snapshot.tree.files, 3);
-            let preview = shared.lock().unwrap().preview.clone().unwrap();
-            let nested = preview
-                .entries
-                .iter()
-                .find(|entry| entry.name == "nested")
-                .unwrap();
-            assert_eq!(nested.bytes, 5);
-            assert_eq!(nested.files, 1);
-            assert_eq!(
-                preview.entries.iter().map(|e| e.bytes).sum::<u64>(),
-                snapshot.tree.bytes
-            );
+            let progress = shared.lock().unwrap();
+            assert_eq!(progress.bytes, snapshot.tree.bytes);
+            assert_eq!(progress.files, snapshot.tree.files);
+            // Only the Unix streaming walker emits live-tree records; the
+            // Windows fallback sends the completed tree without a preview.
+            assert_eq!(progress.preview.is_some(), cfg!(unix));
+            if let Some(preview) = &progress.preview {
+                let nested = preview
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == "nested")
+                    .unwrap();
+                assert_eq!(nested.bytes, 5);
+                assert_eq!(nested.files, 1);
+                assert_eq!(
+                    preview.entries.iter().map(|e| e.bytes).sum::<u64>(),
+                    snapshot.tree.bytes
+                );
+            }
         }
     }
 
