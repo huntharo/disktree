@@ -25,13 +25,15 @@ const MAX_DIAGNOSTICS: usize = 16 << 10;
 
 /// Whether `path` names a directory from the remote host's root.
 ///
-/// The SSH helper is Unix-only, so remote paths are `/`-rooted.
-/// `Path::is_absolute` also wants a drive letter on Windows, and
-/// `Path::has_root` accepts `\x` and `C:\x` there, so neither works for a
-/// Windows client. On Unix this agrees with `is_absolute`.
+/// `serve` runs on Windows as well as Unix, so a remote path is either
+/// `/`-rooted or absolute the Windows way. On Windows
+/// `Path::is_absolute` wants a drive letter, which rejects every Unix path,
+/// and `Path::has_root` also accepts `\x`, which is neither. On Unix this
+/// agrees with `is_absolute`.
 #[must_use]
 pub fn is_remote_absolute(path: &Path) -> bool {
-    path.as_os_str().as_encoded_bytes().first() == Some(&b'/')
+    path.is_absolute()
+        || path.as_os_str().as_encoded_bytes().first() == Some(&b'/')
 }
 
 // Non-interactive shells often omit ~/.local/bin. Do not require users to
@@ -1102,18 +1104,17 @@ mod tests {
         );
     }
 
-    /// Remote paths come from a Unix host, so a Windows client must accept
-    /// them without a drive letter.
+    /// A Windows client must accept a Unix host's paths without a drive
+    /// letter, and every client accepts its own platform's absolute paths.
     #[test]
     fn remote_paths_are_absolute_without_a_drive_letter() {
         assert!(is_remote_absolute(Path::new("/")));
         assert!(is_remote_absolute(Path::new("/home/someone")));
         assert!(!is_remote_absolute(Path::new("home/someone")));
         assert!(!is_remote_absolute(Path::new("")));
-        // Windows-rooted paths name nothing on a Unix host.
+        // Rooted without a drive is absolute nowhere.
         assert!(!is_remote_absolute(Path::new(r"\home\someone")));
-        assert!(!is_remote_absolute(Path::new(r"C:\Users")));
-        assert!(!is_remote_absolute(Path::new(r"\\server\share")));
+        assert_eq!(is_remote_absolute(Path::new(r"C:\Users")), cfg!(windows));
     }
 
     #[test]
