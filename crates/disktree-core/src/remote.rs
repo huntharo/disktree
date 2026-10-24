@@ -1205,6 +1205,9 @@ mod tests {
         assert_eq!(shared.lock().unwrap().stage, Stage::Finalizing);
     }
 
+    // The live preview this checks comes from the Unix helper's streaming
+    // walk; on other systems `serve` sends a finished tree with no preview.
+    #[cfg(unix)]
     #[test]
     fn desktop_dedup_counts_links_once_without_requiring_external_names() {
         let dir = tempfile::tempdir().unwrap();
