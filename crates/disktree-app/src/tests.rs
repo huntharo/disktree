@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use disktree_core::path_style::PathStyle;
 use disktree_core::removal::RemovalMode;
 use disktree_core::scan::{ScanOptions, scan};
 use disktree_core::space::{SpaceInfo, Volume};
@@ -63,6 +64,29 @@ fn view_over<'a>(
     let focus = view.read_with(cx, |app, _| app.focus.clone());
     cx.update(|window, cx| window.focus(&focus, cx));
     (view, cx)
+}
+
+/// The fixture as an SSH session holds it. Remote paths are POSIX on every
+/// client, so the root must be `/`-rooted: the temporary directory itself on
+/// Unix, which keeps "nothing on disk changed" checks meaningful, and a Unix
+/// path on Windows, whose temporary directory is `C:\…`.
+fn remote_view_over<'a>(
+    temp: &Path,
+    cx: &'a mut TestAppContext,
+) -> (Entity<Disktree>, &'a mut Window, PathBuf) {
+    let root = if cfg!(unix) {
+        temp.to_path_buf()
+    } else {
+        PathBuf::from("/srv/fixture")
+    };
+    let tree = scan(temp, options()).expect("scan the fixture");
+    let root_path = root.clone();
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_tree(root_path.clone(), tree, options(), 3, cx)
+    });
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    (view, cx, root)
 }
 
 fn draw(cx: &mut Window) {
@@ -305,14 +329,15 @@ fn switching_from_remote_to_local_clears_machine_specific_marks(
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let target = fixture();
-    let (view, cx) = view_over(temp.path(), cx);
+    let (view, cx, root) = remote_view_over(temp.path(), cx);
+    let junk = PathStyle::Posix.join(&root, "junk");
     update(&view, cx, |app, cx| {
         app.remote = Some("old-source".into());
         app.remote_identity = Some(disktree_core::identity::HostIdentity {
             hostname: "old-source".into(),
             machine_id: None,
         });
-        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        let crumbs = app.crumbs_for_path(&junk).unwrap();
         app.select(Some(crumbs), cx);
         app.toggle_mark_selected(cx);
         assert!(!app.marks.is_empty());
@@ -474,7 +499,8 @@ fn repointing_an_ssh_alias_never_reuses_old_machine_marks(
 ) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
-    let (view, cx) = view_over(temp.path(), cx);
+    let (view, cx, root) = remote_view_over(temp.path(), cx);
+    let junk = PathStyle::Posix.join(&root, "junk");
     update(&view, cx, |app, cx| {
         let old = disktree_core::identity::HostIdentity {
             hostname: "same-name".into(),
@@ -482,7 +508,7 @@ fn repointing_an_ssh_alias_never_reuses_old_machine_marks(
         };
         app.remote = Some("stable-alias".into());
         app.update_remote_identity(Some(old.clone()));
-        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        let crumbs = app.crumbs_for_path(&junk).unwrap();
         app.select(Some(crumbs), cx);
         app.toggle_mark_selected(cx);
         app.update_remote_identity(Some(old.clone()));
@@ -507,10 +533,11 @@ fn remote_review_never_deletes_even_through_direct_actions(
 ) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
-    let (view, cx) = view_over(temp.path(), cx);
+    let (view, cx, root) = remote_view_over(temp.path(), cx);
+    let junk = PathStyle::Posix.join(&root, "junk");
     update(&view, cx, |app, cx| {
         app.remote = Some("dev".into());
-        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        let crumbs = app.crumbs_for_path(&junk).unwrap();
         app.select(Some(crumbs), cx);
         app.toggle_mark_selected(cx);
         app.screen = Screen::Review;
@@ -1269,7 +1296,8 @@ fn remote_review_copies_host_guarded_script_and_prompt(
 ) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
-    let (view, cx) = view_over(temp.path(), cx);
+    let (view, cx, root) = remote_view_over(temp.path(), cx);
+    let junk = PathStyle::Posix.join(&root, "junk");
     update(&view, cx, |app, cx| {
         app.remote = Some("dev-alias".into());
         app.remote_identity = Some(disktree_core::identity::HostIdentity {
@@ -1277,7 +1305,7 @@ fn remote_review_copies_host_guarded_script_and_prompt(
             machine_id: Some("abcdefabcdefabcdefabcdefabcdefab".into()),
         });
         app.marks.toggle(disktree_core::removal::Target {
-            path: temp.path().join("junk"),
+            path: junk.clone(),
             bytes: 300_000,
             is_dir: true,
             hidden: false,
