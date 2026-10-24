@@ -5,7 +5,7 @@
 //! and stream without making a second serialized copy of the whole tree.
 
 use std::io::{self, BufRead, BufReader, Read as _, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -20,6 +20,18 @@ use crate::tree::{Node, NodeKind, aggregate};
 use std::time::Instant;
 
 const VERSION: u32 = 1;
+
+/// Whether `path` names a directory from the remote host's root.
+///
+/// The SSH helper is Unix-only, so remote paths are always `/`-rooted.
+/// `Path::is_absolute` also wants a drive letter on Windows, which would
+/// reject every remote path a Windows client receives. On Unix the two
+/// checks agree.
+#[must_use]
+pub fn is_remote_absolute(path: &Path) -> bool {
+    path.has_root()
+}
+
 const MAX_LINE: u64 = 1 << 20;
 const MAX_DIAGNOSTICS: usize = 16 << 10;
 
@@ -84,8 +96,11 @@ pub fn read_roots(input: &mut impl BufRead) -> io::Result<Roots> {
         || roots
             .volumes
             .iter()
-            .any(|volume| !volume.point.is_absolute())
-        || roots.home.as_ref().is_some_and(|home| !home.is_absolute())
+            .any(|volume| !is_remote_absolute(&volume.point))
+        || roots
+            .home
+            .as_ref()
+            .is_some_and(|home| !is_remote_absolute(home))
     {
         return Err(io::Error::other("incompatible remote root discovery"));
     }
@@ -312,7 +327,7 @@ fn read_snapshot_with_progress(
     shared: &Shared,
 ) -> io::Result<Snapshot> {
     let header: Header = receive(input)?;
-    if header.version != VERSION || !header.root.is_absolute() {
+    if header.version != VERSION || !is_remote_absolute(&header.root) {
         return Err(io::Error::other("incompatible remote helper protocol"));
     }
     let mut progress = Progress {
@@ -577,7 +592,8 @@ impl RemoteScan {
         Self::spawn_with_archive(command, host, request, archive)
     }
 
-    #[cfg(test)]
+    // Only the Unix tests run a fake ssh, so Windows has no caller.
+    #[cfg(all(test, unix))]
     fn spawn_command(
         command: Command,
         host: &str,
@@ -744,6 +760,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn wait<T: Send + 'static>(scan: &RemoteJob<T>) -> io::Result<T> {
         wait_for(scan, std::time::Duration::from_secs(10))
     }
@@ -1084,6 +1101,16 @@ mod tests {
             snapshot.tree.dirs,
             snapshot.header.space,
         );
+    }
+
+    /// Remote paths come from a Unix host, so a Windows client must accept
+    /// them without a drive letter.
+    #[test]
+    fn remote_paths_are_absolute_without_a_drive_letter() {
+        assert!(is_remote_absolute(Path::new("/")));
+        assert!(is_remote_absolute(Path::new("/home/someone")));
+        assert!(!is_remote_absolute(Path::new("home/someone")));
+        assert!(!is_remote_absolute(Path::new("")));
     }
 
     #[test]
