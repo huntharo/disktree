@@ -5,8 +5,9 @@
 Find what is filling a disk, mark what should go, and remove it — with the
 volume's free space in view the whole time.
 
-disktree is a treemap for Omarchy. It scans your home directory by default,
-draws every directory as a nested mosaic sized by what it really costs on disk,
+disktree is a treemap for Omarchy. Choose a local or SSH source, then a
+mounted volume or directory; no scan starts until you explicitly accept.
+It draws every directory as a nested mosaic sized by its real disk cost,
 and lets you walk into it with the keyboard or the mouse. Mark as much as you
 like; nothing happens until you review the list and commit, and the permanent
 path always asks first.
@@ -48,6 +49,17 @@ the release binary:
 
 ```sh
 yay -S disktree-bin
+```
+
+If another installed version wins on `PATH`, the installer warns which one.
+Run `export PATH="$HOME/.local/bin:$PATH"` and add that setting to your shell
+configuration so the locally installed build takes precedence.
+
+For Linux builds with embedded SSH helpers, also install the two Rust
+standard-library targets (no external C cross-compiler is needed):
+
+```sh
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 ```
 
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
@@ -142,11 +154,150 @@ See [On Windows](#on-windows) for what differs there.
 ## Use
 
 ```sh
-disktree            # scan the home directory
+disktree            # choose a local/SSH source and root
+disktree ~          # explicitly scan home
 disktree --disk     # the whole disk it lives on
 disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
+
+### Servers over SSH (read-only)
+
+```sh
+disktree ssh dev                 # connect and choose a remote root
+disktree ssh user@server /var    # an explicit remote path
+disktree ssh dev --disk          # the disk containing the remote home
+disktree ssh dev -a /srv         # apparent size instead of allocated blocks
+```
+
+Linux builds made with `make build` / `cargo xtask portable` include static
+**x86-64 and ARM64 Linux scanners appended to the executable**. SSH detects
+the server's OS/CPU and uploads the matching scanner only when its checked
+cache is missing or damaged. The cache is private and content-addressed under
+`~/.cache/disktree/ssh/<sha256>/` (or the server's `XDG_CACHE_HOME`).
+Uploads are checksum-verified and atomically installed; there is no sudo,
+system-package change or dependency on the server's glibc version.
+
+This uses stable Rust's musl targets rather than Cosmopolitan: the existing
+Rust/rayon/rustix scanner has no supported stable Cosmopolitan target. These
+are Linux binaries, not a single executable for every OS; ARM64 is built and
+ELF-validated, while x86-64 was also executed against a real server.
+
+You can extract a helper without opening a window, or test the entire
+SSH/deployment/scan path headlessly:
+
+```sh
+disktree extract-scanner x86_64 ./disktree-scan
+disktree extract-scanner aarch64 ./disktree-scan-arm64
+disktree ssh dev --check /var/log
+```
+
+The appended manifest stores architecture, byte ranges and SHA-256 hashes.
+Do not run `strip` after packaging: it discards the trailer. The Linux release
+pipeline strips first, embeds last, and ships that single file. Appending to
+signed macOS/Windows executables needs platform-specific signature handling;
+those builds do not yet embed helpers.
+
+For a development or non-Linux desktop build without the trailer, install
+the small **disktree-scan** helper on the server first:
+
+```sh
+# On the server, inside the checkout:
+make install-scan               # ~/.local/bin/disktree-scan; no GUI deps
+# Or:
+cargo install --path crates/disktree-scan --locked
+```
+
+The helper can be on the server's **non-interactive SSH PATH** or at
+`~/.local/bin/disktree-scan` (the default install location); disktree tries
+both. A binary copied from another machine must match the server's OS,
+architecture and runtime. The manually built native helper may need the
+server's libc; the embedded Linux helpers are static. Disktree never runs
+sudo or changes the server's configuration.
+SSH keeps your normal authentication settings. When launched from a
+terminal, it can ask for a password or key passphrase there; GUI launches
+need key/agent access or a working SSH askpass helper. Connect once with
+`ssh dev` to verify access and accept its host key.
+
+The protocol also supports lightweight root discovery, separate from a scan:
+it reads the target's mount namespace without walking or probing the listed
+paths. Same-device mounts remain distinct choices; capacity is unknown
+until a root is explicitly selected. Discovery requests omit scan fields,
+so outdated helpers reject them instead of silently scanning their home.
+
+The Linux/macOS helper streams a depth-first walk directly to stdout. It
+never constructs a tree or retains a directory's children: memory scales
+with open ancestors, not file count. Deep directories are not rejected
+at an arbitrary depth; filesystem errors are reported as unreadable.
+Hardlink identities are sent to the desktop, which uses the local scanner's
+compact identity index to count each inode once. The helper keeps no
+per-file identity table in negotiated desktop-de-duplication mode; links
+outside the chosen root cannot fill one. Older clients retain bounded
+helper-side accounting for wire compatibility. A resource limit fails
+explicitly instead of returning a partial tree. Symlinks are not followed,
+and every nested mount is skipped, even a bind mount or same-device
+subvolume. Select those as separate roots.
+
+While indexing, a quiet sidebar shows live files, directories, measured
+bytes, read errors and elapsed time. Counters and paths use monospace type
+in fixed lanes; changing values do not re-center or reflow the screen.
+Narrow windows use a compact progress footer instead.
+
+Ordinary local walks and current SSH helpers paint a **live top-level
+overview** before the full tree arrives. These are measured contributions,
+not complete directory sizes. Updates are limited to once a second, in
+arrival order, with at most 128 named buckets plus an overflow bucket. The
+preview is kept separate from the real tree: it cannot be navigated,
+marked or removed. On completion the full, actionable treemap replaces it;
+on error or cancellation the preview is discarded. The Windows file-table
+fast path still waits for its complete tree. Remote scans also show a
+sampled recent directory and connection / helper setup / indexing / treemap
+stages. Progress uses a single replaceable snapshot, not a growing event
+queue; path updates are throttled to five per second. There is no guessed
+percentage: the total is unknown until the walk finishes. Older helpers
+still provide counters from their streamed records, without path samples.
+
+One compressed SSH connection carries a bounded JSON request on stdin and
+compact postorder records on stdout. The client keeps stdin open so the
+helper exits on disconnect, including while scanning or blocked on output.
+Linux helpers also enforce a 1 GiB address-space ceiling, disable core dumps,
+and stop after five minutes. File contents never cross the connection and
+paths are never interpolated into remote shell commands. Only the desktop
+retains the complete tree for offline navigation; its memory still scales
+with entry count. The native Windows helper currently retains the original
+tree-building scan path.
+
+Remote mode is **export-only**. Mark with Space, open review with `c`, then:
+
+- **Copy as prompt** (`a`): includes the SSH host, remote OS, scan root,
+  selected paths, sizes and cleanup precautions. It requires verifying the
+  actual scanned hostname and machine ID before any destructive operation,
+  and stopping if either check fails or cannot be performed.
+- **Save list…** (`s`): remote paths, one per line, saved locally.
+- **Copy delete script** (`y`), or **Save delete script…** (`e`): a
+  GNU/Linux shell script, copied to the clipboard or saved locally.
+  Running it without arguments only previews the selection. After reviewing
+  it, `sh disktree-delete.sh --delete` connects to the named SSH host and
+  runs the exported commands there, never against the local paths.
+
+There are no trash/delete buttons or removal-mode choices in remote review.
+Deletion shortcuts and removal entry points are disabled too. Git inspection,
+local folder selection and file-manager reveal are disabled so remote names
+cannot accidentally act on this computer. Free space is sampled when the
+scan starts, **not live**; press `r` to refresh.
+
+Before deleting, scripts compare the server's actual kernel hostname and
+machine ID against the identity captured in the scan—not the SSH alias.
+Missing identity or any mismatch aborts. The check runs on the SSH target,
+not the computer launching the wrapper. Pasting the script previews it by
+default and runs in a subshell, so its exit cannot close your terminal.
+
+Exports are not an automatic cleanup recommendation. Scripts refuse system
+paths, the scan root, home or its ancestors, symlinked/changed canonical paths,
+and paths containing mount points. Control-character names are omitted.
+These checks do not eliminate filesystem races or tell you whether git work
+is backed up; review the script and prefer a tool's own cleanup command for
+tool-owned data. The remote helper itself has no delete operation.
 
 ### The screen
 
@@ -239,7 +390,7 @@ and shows how much free space was actually gained.
 | `i` | include or skip hidden entries |
 | `r` | scan again |
 | `esc` while scanning | stop the scan |
-| `v` | scan another mounted volume |
+| `v` | choose a local/SSH source and root |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
@@ -283,13 +434,31 @@ scope per root, a completion counter per directory so no directory is built
 before its last subdirectory lands, and one bottom-up pass that aggregates sizes
 and removes duplicate hardlinks.
 
-## Switching volumes
+## Choosing sources and roots
 
-Press `v` (or click **Volumes** beside the disk name in the side panel) to
-bring up the volume picker. It lists every candidate volume mounted on the
-system together with its free space, ordered fullest first, filtering out
-pseudo-filesystems and duplicate btrfs/APFS mount points. Selecting any
-entry resets the scan root directly to that volume.
+Launch without a path to choose **This computer** or enter an SSH alias /
+`user@host` and press **Connect SSH**. Discovery reads that machine's mount
+namespace, not file contents. It never starts a scan or probes mounted
+network filesystems just to fill the list.
+
+Select a mount and choose **Scan selected root**, or enter an absolute
+directory path and choose **Scan directory**. Enter acts on the focused
+host/path field or the highlighted mount. Escape cancels discovery and
+returns to the current scan, or the idle welcome screen at startup.
+
+During exploration, press `v`, click **Source…** beside the disk name,
+or click the disktree logo to reopen the same chooser. The source being
+browsed is shown explicitly, and connecting never retargets an existing
+scan. Changing machines on acceptance clears the old machine's marks,
+identity and navigation history; an absolute path is not an identity
+across hosts. A rescan that detects a changed or lost remote machine
+identity also clears marks, even if the SSH alias is unchanged.
+
+Pseudo-filesystems, snapshots and automount triggers are filtered out.
+Linux bind mounts and btrfs subvolumes remain individually selectable,
+even when they share a device. Free space is measured only after choosing
+a root. Explicit command-line paths and `--disk` still start directly;
+`ssh HOST --check [PATH]` remains the headless scan command.
 
 ## The whole disk
 
@@ -306,15 +475,15 @@ outside `~` (on this machine, seconds instead of a full rescan). The current
 view stays on screen until the wider tree lands, which then opens with the
 directory you came from selected. Going back down is just navigation.
 
-A scan stays on one volume, and a volume is the mount *source*, not the
-device number: btrfs gives each subvolume its own `st_dev`, so `/home`,
-`/var/log` and `/var/cache/pacman/pkg` are included, while `/proc`,
-`/sys`, `/run`, tmpfs, `/boot`, other disks, network shares and automount
-points are left out (checked by path, so an automounted NAS is never
-mounted just to be measured). Snapshot subvolumes are left out too: their
-files share blocks with the live ones, and counting them would count the disk
-twice. `-X` crosses into everything: a mark that lands on another volume is
-still removed, but it is not added to the metered volume's free space.
+By default a scan stops at **every nested mount point**, including bind
+mounts and same-device btrfs subvolumes. Boundaries are checked by path,
+before metadata or directory reads, so an automounted NAS is not activated
+just to measure its parent. Choose `/home`, `/var/log`, or another mount as
+its own root rather than implicitly traversing it from `/`.
+
+Local `-X` explicitly crosses mounts; remote streaming scans reject it.
+A local mark on another volume is still removed, but is not added to the
+metered volume's free-space projection.
 
 Without root, some system directories cannot be read; they are counted as
 unreadable in the top bar rather than guessed at.
@@ -401,9 +570,10 @@ windowrule = size 1400 900, class:^(disktree)$
 ## Develop
 
 ```sh
-make run      # release build, scanning $HOME
+make run      # release build, opening the source/root chooser
 make lint     # rustfmt --check, then clippy with every warning an error
 make test     # scanner, layout and removal tests, plus window-harness tests
+make test-ssh # real localhost SSH scans/errors; Linux, bun + openssh required
 make ci       # lint, then test
 ```
 

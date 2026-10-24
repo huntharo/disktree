@@ -7,6 +7,7 @@
 //! signal CI gives.
 
 mod bundle;
+mod portable;
 
 use std::process::{Command, ExitCode, Stdio};
 
@@ -20,7 +21,7 @@ tasks:
   clippy    clippy --workspace --all-targets -- -D warnings
   test      cargo test --workspace
   ci        lint, then test
-  bundle    macOS: target/bundle/disktree.app and its zip
+  portable  Linux: desktop executable with static x86_64/ARM64 scanners\n  bundle    macOS: target/bundle/disktree.app and its zip
               --sign IDENTITY   sign with a Developer ID (default: ad hoc)
               --notarize        notarize and staple; needs NOTARY_PROFILE, or
                                 NOTARY_KEY, NOTARY_KEY_ID and NOTARY_ISSUER
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
         "test" => test(),
         "ci" => fmt(false).and_then(|()| clippy()).and_then(|()| test()),
         "bundle" => bundle::bundle(&args[1..]),
+        "portable" => portable::build(),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;

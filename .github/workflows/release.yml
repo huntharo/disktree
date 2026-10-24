@@ -91,7 +91,9 @@ jobs:
         run: cargo xtask test
 
       - name: Build
-        run: cargo build --release --locked -p disktree-app
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo xtask portable
 
       - name: Package
         id: package
@@ -101,8 +103,8 @@ jobs:
         run: |
           name="disktree-$VERSION-$ARCH-linux"
           mkdir -p "dist/$name"
-          cp target/release/disktree "dist/$name/"
-          strip "dist/$name/disktree"
+          # portable strips before appending; stripping again loses helpers.
+          cp target/portable/disktree "dist/$name/"
           cp packaging/install.sh packaging/disktree.desktop.in \
              assets/disktree.svg README.md LICENSE "dist/$name/"
           echo "$VERSION" > "dist/$name/VERSION"

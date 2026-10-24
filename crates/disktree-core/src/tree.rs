@@ -27,7 +27,16 @@ impl NodeKind {
 }
 
 /// How a node's importance is measured.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum Metric {
     /// Bytes, apparent or on-disk depending on [`crate::scan::ScanOptions`].
     #[default]
@@ -340,7 +349,7 @@ impl Seen {
     }
 
     /// Whether `key` is new.
-    fn insert(&self, key: (u64, u64)) -> bool {
+    pub(crate) fn insert(&self, key: (u64, u64)) -> bool {
         let (volume, number) = key;
         if *self.volume.get_or_init(|| volume) == volume && number < Self::BITS
         {

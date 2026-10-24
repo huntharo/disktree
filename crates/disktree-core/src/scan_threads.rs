@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Filesystem concurrency for one scan, independent of the global Rayon pool.
 /// A scan crossing several volumes shares this budget; separate scans do not.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScanThreads {
     /// Fixed scan workers, capped by available CPUs; `usize::MAX` uses the
     /// shared platform-default pool. With `adaptive`, maximum admitted directory

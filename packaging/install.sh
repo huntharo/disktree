@@ -29,7 +29,15 @@ echo "installed disktree $VERSION:"
 echo "  $BINDIR/disktree"
 echo "  $APPDIR/disktree.desktop"
 echo "  $ICONDIR/disktree.svg"
-case ":$PATH:" in
-    *":$BINDIR:"*) ;;
-    *) echo; echo "note: $BINDIR is not on PATH in this shell" ;;
-esac
+resolved=$(command -v disktree 2>/dev/null || true)
+if [ -z "$resolved" ] || ! [ "$resolved" -ef "$BINDIR/disktree" ]; then
+    echo
+    if [ -n "$resolved" ]; then
+        echo "warning: disktree still resolves to $resolved"
+        echo "         that hides the build in $BINDIR"
+    else
+        echo "warning: $BINDIR is not on PATH"
+    fi
+    printf '%s\n' "Run in your shell: export PATH=\"$BINDIR:\$PATH\""
+    echo "Then add that PATH setting to your shell configuration."
+fi

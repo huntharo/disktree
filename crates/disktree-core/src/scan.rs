@@ -36,13 +36,14 @@ use crate::tree::{Metric, Node, NodeKind, Seen, aggregate, aggregate_deduped};
 const MAX_ERROR_DETAIL: usize = 50;
 
 /// How a scan measures and filters the tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScanOptions {
     /// Measure apparent length instead of allocated blocks. Apparent size is
     /// what `ls -l` shows; blocks are what the volume actually spends, which is
     /// what a disk-space tool normally wants.
     pub apparent_size: bool,
     /// Read APFS clone hints and private sizes on macOS.
+    #[serde(default = "clone_metadata_default")]
     pub apfs_clone_metadata: bool,
     /// Follow symlinks. Off by default: a home directory is full of links, and
     /// following them double-counts.
@@ -51,8 +52,8 @@ pub struct ScanOptions {
     /// `~/.cache` is frequently the largest directory in a home directory.
     pub include_hidden: bool,
     /// Stay on the root's volume: skip other disks, pseudo filesystems,
-    /// network shares and automount points, but keep subvolumes of the same
-    /// disk. See [`crate::space::foreign_mounts`]. On by default: a disk
+    /// network shares, bind mounts and subvolumes. Select those explicitly
+    /// as another root. See [`crate::space::mount_boundaries`]. A disk
     /// tool measures a disk, and its free-space meter only means anything
     /// for one volume.
     pub one_filesystem: bool,
@@ -64,14 +65,20 @@ pub struct ScanOptions {
     /// Whether children are ranked by bytes or by file count.
     pub metric: Metric,
     /// Directory admission for this scan; other scans have their own budget.
+    #[serde(default)]
     pub threads: ScanThreads,
+}
+
+// Existing SSH requests predate this optional local-macOS scan hint.
+const fn clone_metadata_default() -> bool {
+    true
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             apparent_size: false,
-            apfs_clone_metadata: true,
+            apfs_clone_metadata: clone_metadata_default(),
             follow_links: false,
             include_hidden: true,
             one_filesystem: true,
@@ -97,6 +104,8 @@ pub struct ScanProgress {
     finished: AtomicBool,
     cancelled: AtomicBool,
     messages: Mutex<Vec<String>>,
+    preview_root: OnceLock<PathBuf>,
+    preview: Mutex<crate::scan_preview::Builder>,
     pub(crate) threads: AtomicUsize,
     pub(crate) threads_settled: AtomicBool,
     pub(crate) thread_tuning_complete: AtomicBool,
@@ -124,6 +133,26 @@ pub struct ScanSnapshot {
 }
 
 impl ScanProgress {
+    pub fn preview(&self) -> crate::scan_preview::Preview {
+        lock(&self.preview).snapshot()
+    }
+
+    fn preview_add(&self, path: &Path, bytes: u64, files: u64) {
+        let Some(root) = self.preview_root.get() else {
+            return;
+        };
+        let Ok(below) = path.strip_prefix(root) else {
+            return;
+        };
+        let name = below
+            .components()
+            .next()
+            .map(|part| part.as_os_str().to_string_lossy());
+        let mut preview = lock(&self.preview);
+        preview.add(name.as_deref(), bytes, files);
+        preview.directory(path);
+    }
+
     pub(crate) fn entries(&self) -> u64 {
         self.files.load(Ordering::Relaxed) + self.dirs.load(Ordering::Relaxed)
     }
@@ -383,6 +412,15 @@ impl WalkContext {
         {
             return Classified::Skipped;
         }
+        if self.options.one_filesystem
+            && let Some(foreign) = self.foreign_mounts.get()
+        {
+            // Checked by path before anything reads the directory, so an
+            // automount point is never triggered.
+            if foreign.contains(&path) {
+                return Classified::Skipped;
+            }
+        }
         // Read at most once per directory: macOS needs it for the dataless
         // flag, and the device check below wherever the mount table cannot
         // be read, which on macOS is everywhere.
@@ -405,15 +443,7 @@ impl WalkContext {
             tree.name = entry.take_name();
             return Classified::Entry(tree);
         }
-        if self.options.one_filesystem
-            && let Some(foreign) = self.foreign_mounts.get()
-        {
-            // Checked by path before anything reads the directory, so an
-            // automount point is never triggered.
-            if foreign.contains(&path) {
-                return Classified::Skipped;
-            }
-        } else if self.options.one_filesystem {
+        if self.options.one_filesystem && self.foreign_mounts.get().is_none() {
             match (directory(), self.root_device(&path)) {
                 (Ok(directory), Some(root_device))
                     if directory.device != root_device =>
@@ -903,6 +933,7 @@ impl PendingDir {
 }
 
 fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
+    let _ = context.progress.preview_root.set(root.to_path_buf());
     let owned = fixed_pool(context.options.threads)?;
     let pool = owned.as_ref().unwrap_or_else(|| &WALK_POOL);
     scan_on_pool(root, context, pool)
@@ -951,7 +982,7 @@ fn scan_on_pool(
     let _ = context.never_scanned.set(never.into_iter().collect());
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));
-        if let Some(foreign) = crate::space::foreign_mounts_for(canonical) {
+        if let Some(foreign) = crate::space::mount_boundaries_for(canonical) {
             let _ = context.foreign_mounts.set(foreign.into_iter().collect());
         }
     }
@@ -1099,7 +1130,8 @@ impl Tally {
         self.bytes += node.bytes;
     }
 
-    fn flush(&mut self, progress: &ScanProgress) {
+    fn flush(&mut self, progress: &ScanProgress, path: &Path) {
+        progress.preview_add(path, self.bytes, self.files);
         progress.add(self.files, self.dirs, self.bytes);
         *self = Self::default();
     }
@@ -1191,7 +1223,7 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
                             Classified::Skipped => {}
                         }
                         if tally.files + tally.dirs >= TALLY_EVERY {
-                            tally.flush(&context.progress);
+                            tally.flush(&context.progress, &dir.path);
                         }
                     }
                     Err(error) => {
@@ -1205,7 +1237,7 @@ fn walk(dir: &Arc<PendingDir>, context: &WalkContext) -> Vec<Arc<PendingDir>> {
             dir.read_error.store(true, Ordering::Relaxed);
         }
     }
-    tally.flush(&context.progress);
+    tally.flush(&context.progress, &dir.path);
 
     // A depth-limited scan still measures what is directly in the directory,
     // it just does not descend further.
@@ -1313,7 +1345,7 @@ fn leaf_node(
 
 /// Last write time in Unix seconds, from the metadata the walk already has:
 /// age costs no extra system call.
-fn modified_seconds(meta: &Metadata) -> i64 {
+pub(crate) fn modified_seconds(meta: &Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1322,7 +1354,7 @@ fn modified_seconds(meta: &Metadata) -> i64 {
         })
 }
 
-fn measure(meta: &Metadata, apparent_size: bool) -> u64 {
+pub(crate) fn measure(meta: &Metadata, apparent_size: bool) -> u64 {
     if apparent_size {
         meta.len()
     } else {
@@ -1475,6 +1507,24 @@ mod tests {
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(&path, vec![b'x'; bytes]).expect("write");
         path
+    }
+
+    #[test]
+    fn scan_options_accept_requests_without_optional_clone_metadata() {
+        let mut request = serde_json::to_value(ScanOptions::default())
+            .expect("scan options JSON");
+        let options = request.as_object_mut().expect("options object");
+        options.remove("apfs_clone_metadata");
+        let decoded: ScanOptions = serde_json::from_value(request.clone())
+            .expect("existing SSH request without clone option");
+        assert!(decoded.apfs_clone_metadata);
+        request
+            .as_object_mut()
+            .expect("options object")
+            .insert("apfs_clone_metadata".into(), false.into());
+        let disabled: ScanOptions =
+            serde_json::from_value(request).expect("explicit clone option");
+        assert!(!disabled.apfs_clone_metadata);
     }
 
     fn scan_dir(root: &Path, options: &ScanOptions) -> Node {
@@ -1884,6 +1934,23 @@ mod tests {
         assert!(snapshot.finished);
         assert_eq!(snapshot.files, 2);
         assert_eq!(snapshot.errors, 0);
+        let preview = handle.progress.preview();
+        assert!(
+            preview
+                .entries
+                .iter()
+                .any(|e| e.name == "a" && e.bytes == 1024)
+        );
+        assert!(
+            preview
+                .entries
+                .iter()
+                .any(|e| e.name == "b" && e.bytes == 2048)
+        );
+        assert_eq!(
+            preview.entries.iter().map(|e| e.bytes).sum::<u64>(),
+            tree.bytes
+        );
     }
 
     #[test]
