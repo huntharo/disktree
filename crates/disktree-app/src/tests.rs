@@ -521,6 +521,14 @@ fn remote_root_acceptance_never_stats_the_path_locally(
     });
     draw(cx);
     update(&view, cx, |app, cx| {
+        let before = app.root_path.clone();
+        for path in ["relative", r"C:\local-only", r"\local-only"] {
+            app.choose_source_root(PathBuf::from(path), cx);
+            assert!(app.picker_error.is_some());
+            assert_eq!(app.root_path, before);
+            assert!(app.remote.is_none());
+            assert!(!app.marks.is_empty());
+        }
         app.choose_volume(cx);
         assert_eq!(app.remote.as_deref(), Some("-test-fixture"));
         assert_eq!(app.root_path, PathBuf::from("/only-on-the-remote-host"));
@@ -1101,7 +1109,10 @@ fn enter_in_the_focused_volume_picker_scans_the_selected_root(
     assert!(!read(&view, cx, Disktree::can_start_over));
     press(cx, "enter");
     assert!(!read(&view, cx, |app| app.volumes_open));
-    assert_eq!(read(&view, cx, |app| app.root_path.clone()), target);
+    assert_eq!(
+        read(&view, cx, |app| app.root_path.clone()),
+        dunce::canonicalize(&target).unwrap()
+    );
     finish_scan(&view, cx);
     assert!(read(&view, cx, |app| app.tree().is_some()));
 }
