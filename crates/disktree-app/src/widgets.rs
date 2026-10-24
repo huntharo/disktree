@@ -15,13 +15,6 @@ use gpui_omarchy::{ActiveTheme, Status};
 
 use crate::ui::{space, text};
 
-use crate::state::Disktree;
-
-/// The scanned root, shortened to `~` where it is the home directory.
-pub fn display_root(app: &Disktree) -> String {
-    crate::marks::display_path(&app.root_path, app.home.as_deref())
-}
-
 /// File counts, which is what a directory count is too.
 pub fn human_count(value: u64) -> String {
     disktree_core::size::human_count(value)

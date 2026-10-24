@@ -25,7 +25,7 @@ use gpui_kit::{
     Window, WindowButton, WindowButtonLayout, WindowControlArea,
     WindowControls, div, img, px, rgb, svg, white,
 };
-use gpui_omarchy::{ActiveTheme as _, IconName, Theme};
+use gpui_omarchy::{ActiveTheme as _, IconName, Theme, with_tooltip};
 
 use crate::palette;
 use crate::state::Disktree;
@@ -264,21 +264,28 @@ pub fn strip(
         .border_color(theme.divider())
         .when(frame.trailing == Controls::None, |strip| strip.pr(space::LG))
         .children(leading)
-        // The brand's area takes the band's full height and the padding
-        // either side of it, so the strip has no dead margin around the
-        // mark that looks like title bar and does not move the window.
-        .child(
-            drag_area(frame, "strip-brand", cx)
+        // The brand replaces the old logo's source picker action. Keep
+        // its full-height padding clickable so the target has no dead edge.
+        .child(with_tooltip(
+            div()
+                .id("strip-brand")
+                .debug_selector(|| "strip-brand".into())
                 .flex()
                 .items_center()
                 .self_stretch()
                 .flex_shrink_0()
+                .cursor_pointer()
                 .when(frame.leading == Controls::None, |area| {
                     area.pl(space::LG)
                 })
                 .pr(space::LG)
-                .child(brand(wordmark, &theme)),
-        )
+                .child(brand(wordmark, &theme))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_volumes(cx);
+                    this.apply_focus(window, cx);
+                })),
+            "Choose local or SSH source · v",
+        ))
         .child(
             div()
                 .flex()

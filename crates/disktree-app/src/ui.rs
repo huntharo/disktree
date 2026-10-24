@@ -61,7 +61,6 @@ pub mod icon {
 
     pub const SM: Rems = Rems(0.75);
     pub const MD: Rems = Rems(0.875);
-    pub const LG: Rems = Rems(1.375);
 }
 
 /// Region and lane widths. Each is the comfortable default for its content at
@@ -84,8 +83,9 @@ pub mod size {
     pub const SWATCH: Rems = Rems(0.625);
     /// A thin meter: share of the scan, the disk.
     pub const METER: Rems = Rems(0.3125);
-    /// The meter on the scanning panel.
-    pub const SCANNING_METER: Rems = Rems(26.25);
+    /// Fixed progress rows keep paths and changing counters from reflowing.
+    pub const PROGRESS_ROW: Rems = Rems(1.375);
+    pub const PROGRESS_VALUE: Rems = Rems(9.0);
     /// The Size | Files | Age choice in the settings row.
     pub const RANKING_CHOICE: Rems = Rems(11.0);
     /// The review screen's summary column.
@@ -96,6 +96,11 @@ pub mod size {
     pub const SIZE_LANE: Rems = Rems(5.0);
     /// The cursor tooltip.
     pub const TOOLTIP: Rems = Rems(16.75);
+    /// Source/root chooser, with room for host, path and mount labels.
+    pub const SOURCE_PICKER: Rems = Rems(40.0);
+    pub const SOURCE_LIST_HEIGHT: Rems = Rems(18.0);
+    /// Leave a visible backdrop even at large interface zoom.
+    pub const SOURCE_VIEWPORT_FRACTION: f32 = 0.92;
     /// The keyboard overlay.
     pub const HELP: Rems = Rems(32.5);
     /// The key column of the keyboard overlay.

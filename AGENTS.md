@@ -7,14 +7,15 @@ A GPUI + gpui-omarchy treemap explorer for disk usage on Omarchy. Read
 
 Find what is eating a volume, mark paths for removal, review the list, and
 remove it — with the volume's free space live on screen the whole time. Two
-phases: explore (treemap, breadcrumbs, the selection and status lines) and review (the marked list,
+phases after choosing a local/SSH source and root: explore (treemap,
+breadcrumbs, selection and status) and review (the marked list,
 the removal mode, the confirmation). Marking is never destructive.
 
 ## Commands
 
 ```sh
 make build                      # release build
-make run                        # build and run, scanning $HOME
+make run                        # build and open the source/root chooser
 make install                    # ~/.local: binary, desktop entry, icon
 make install PREFIX=/usr/local  # system-wide (needs root)
 make uninstall
@@ -107,10 +108,23 @@ and `cargo build --release` directly; CI runs the gate on both systems.
    added to this volume's free space; see `space::attribution`. The final number
    comes from `statvfs` before and after.
 
+10. **Discovery is not a scan.** No implicit home walk at startup. List
+    mounts in the selected machine's namespace without probing them; scans
+    stop at nested mounts, including bind mounts and same-device subvolumes.
+    Switching machines clears marks and identity. The Unix SSH helper streams
+    records and never retains the tree.
+
+11. **A live overview is not an actionable tree.** Keep provisional,
+    bounded display summaries separate from `Disktree::tree` and all path,
+    mark and removal APIs. Only a complete scan may replace the real tree.
+    Counters and sampled paths belong in fixed, monospace progress lanes.
+
 ## Where changes belong
 
 | change | where |
 | --- | --- |
+| bounded Unix SSH traversal | `crates/disktree-core/src/remote_walk.rs` |
+| SSH protocol, discovery and transport | `crates/disktree-core/src/remote.rs` |
 | measurement, filtering, parallelism | `crates/disktree-core/src/scan.rs` |
 | what a node is, or a derived total | `crates/disktree-core/src/tree.rs` |
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |

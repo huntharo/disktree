@@ -23,22 +23,45 @@ UNAME := $(shell uname -s)
 MANIFEST = Cargo.toml
 CARGO ?= cargo
 TARGET = target/release/disktree
+ifeq ($(UNAME),Linux)
+TARGET = target/portable/disktree
+endif
 ICON = assets/disktree.svg
 DESKTOP = packaging/disktree.desktop.in
 
-.PHONY: help build run install uninstall bundle lint test ci fmt clean
+# Being on PATH is not enough: an older package can win earlier in it.
+define check_install_path
+	@resolved=$$(command -v $(1) 2>/dev/null || true); \
+	if [ -n "$$resolved" ] && [ "$$resolved" -ef "$(BINDIR)/$(1)" ]; then \
+	    :; \
+	else \
+	    echo; \
+	    if [ -n "$$resolved" ]; then \
+	        echo "warning: $(1) still resolves to $$resolved"; \
+	        echo "         that hides the build in $(BINDIR)"; \
+	    else \
+	        echo "warning: $(BINDIR) is not on PATH"; \
+	    fi; \
+	    printf 'Run in your shell: export PATH="%s:$$PATH"\n' "$(BINDIR)"; \
+	    echo "Then add that PATH setting to your shell configuration."; \
+	fi
+endef
+
+.PHONY: help build run install install-scan uninstall bundle lint test test-ssh ci fmt clean
 
 help:
 	@echo "disktree"
 	@echo
 	@echo "  make build       release build"
-	@echo "  make run         build and run, scanning $$HOME"
+	@echo "  make run         build and open the source/root chooser"
+	@echo "  make install-scan  build/install the headless SSH helper only"
 	@echo "  make install     install to $(PREFIX): binary, desktop entry, icon"
 	@echo "                   (macOS: disktree.app into $(APPS))"
 	@echo "  make bundle      macOS: build target/bundle/disktree.app and its zip"
 	@echo "  make uninstall   remove what install put there"
 	@echo "  make lint        rustfmt --check and clippy -D warnings"
 	@echo "  make test        core and window-harness tests"
+	@echo "  make test-ssh    real localhost SSH tests (Linux: bun, openssh)"
 	@echo "  make ci          lint, then test"
 	@echo "  make fmt         format in place"
 	@echo "  make clean       cargo clean"
@@ -47,7 +70,18 @@ help:
 # make file-target would only compare the binary against the manifest and
 # happily install a stale build.
 build:
+ifeq ($(UNAME),Linux)
+	$(CARGO) xtask portable
+else
 	$(CARGO) build --release
+endif
+
+# For servers: no desktop, GPU, GPUI build, or elevated permissions needed.
+install-scan:
+	$(CARGO) build --release -p disktree-scan
+	install -d "$(BINDIR)"
+	install -m755 target/release/disktree-scan "$(BINDIR)/disktree-scan"
+	$(call check_install_path,disktree-scan)
 
 run: build
 	$(TARGET)
@@ -57,6 +91,10 @@ lint:
 
 test:
 	$(CARGO) xtask test
+
+# Isolated keys and high localhost port; never uses a real server or root.
+test-ssh:
+	bun scripts/test-ssh.ts
 
 ci: lint test
 
@@ -76,8 +114,7 @@ install:
 	@echo "installed:"
 	@echo "  $(APPS)/disktree.app"
 	@echo "  $(BINDIR)/disktree -> the app's binary"
-	@case ":$$PATH:" in *":$(BINDIR):"*) ;; *) \
-	    echo; echo "note: $(BINDIR) is not on PATH in this shell";; esac
+	$(call check_install_path,disktree)
 
 uninstall:
 	rm -rf "$(APPS)/disktree.app"
@@ -103,8 +140,7 @@ install: build
 	@if command -v desktop-file-validate >/dev/null 2>&1; then \
 	    desktop-file-validate $(APPDIR)/disktree.desktop || true; \
 	fi
-	@case ":$$PATH:" in *":$(BINDIR):"*) ;; *) \
-	    echo; echo "note: $(BINDIR) is not on PATH in this shell";; esac
+	$(call check_install_path,disktree)
 
 uninstall:
 	rm -f $(BINDIR)/disktree $(APPDIR)/disktree.desktop $(ICONDIR)/disktree.svg

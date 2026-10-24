@@ -93,6 +93,488 @@ fn read<R>(
 }
 
 #[gpui_kit::test]
+fn remote_indexing_draws_live_activity_and_the_sampled_directory(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.tree = None;
+        app.remote = Some("fixture-only".into());
+        app.scan = Some(disktree_core::scan::ScanHandle::spawn(
+            temp.path().into(),
+            options(),
+        ));
+        app.scan_started = Some(std::time::Instant::now());
+        app.progress.files = 1234;
+        app.progress.bytes = 123_456;
+        app.remote_progress.stage =
+            disktree_core::remote_progress::Stage::Indexing;
+        app.remote_progress.directory = Some(temp.path().join("junk/deeper"));
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("indexing-progress").is_some());
+    assert!(cx.debug_bounds("scan-directory").is_some());
+    update(&view, cx, |app, _| {
+        app.scan_error = Some("fixture scan failed".into());
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("scan-error").is_some());
+    assert!(cx.debug_bounds("scan-reading").is_none());
+}
+
+#[gpui_kit::test]
+fn loading_values_and_paths_do_not_move_the_sidebar(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.tree = None;
+        app.scan = Some(disktree_core::scan::ScanHandle::spawn(
+            temp.path().into(),
+            options(),
+        ));
+        app.scan_preview =
+            Some(std::sync::Arc::new(disktree_core::scan_preview::Preview {
+                entries: vec![disktree_core::scan_preview::Entry {
+                    name: "junk".into(),
+                    bytes: 100,
+                    files: 1,
+                }],
+                directory: Some(temp.path().join("short")),
+            }));
+    });
+    draw(cx);
+    draw(cx);
+    let panel = cx.debug_bounds("indexing-progress").unwrap();
+    let files = cx.debug_bounds("indexing-files").unwrap();
+    let path = cx.debug_bounds("scan-directory").unwrap();
+    assert!(cx.debug_bounds("scan-preview").is_some());
+    assert!(cx.debug_bounds("scan-reading").is_none());
+    update(&view, cx, |app, _| {
+        app.progress.files = 99_999_999;
+        app.progress.bytes = u64::MAX / 2;
+        app.remote = Some("fixture-only".into());
+        app.remote_progress.directory = Some(PathBuf::from(
+            "/a/very/long/directory/whose/text/must/not/move/the/layout",
+        ));
+    });
+    draw(cx);
+    assert_eq!(panel, cx.debug_bounds("indexing-progress").unwrap());
+    assert_eq!(files, cx.debug_bounds("indexing-files").unwrap());
+    assert_eq!(path, cx.debug_bounds("scan-directory").unwrap());
+    let preview = cx.debug_bounds("scan-preview").unwrap();
+    cx.simulate_click(preview.center(), gpui_kit::Modifiers::none());
+    press(cx, "space");
+    read(&view, cx, |app| {
+        assert!(app.marks.is_empty());
+        assert!(app.tree.is_none());
+    });
+    update(&view, cx, Disktree::cancel_scan);
+    draw(cx);
+    assert!(cx.debug_bounds("scan-preview").is_none());
+    assert!(read(&view, cx, |app| app.scan_preview.is_none()));
+}
+
+#[gpui_kit::test]
+fn narrow_indexing_keeps_a_preview_and_compact_progress_in_bounds(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.tree = None;
+        app.scan = Some(disktree_core::scan::ScanHandle::spawn(
+            temp.path().into(),
+            options(),
+        ));
+        app.scan_preview =
+            Some(std::sync::Arc::new(disktree_core::scan_preview::Preview {
+                entries: vec![disktree_core::scan_preview::Entry {
+                    name: "junk".into(),
+                    bytes: 100,
+                    files: 1,
+                }],
+                directory: None,
+            }));
+    });
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    cx.update(|window, _| window.set_rem_size(px(28.)));
+    draw(cx);
+    draw(cx);
+    let compact = cx.debug_bounds("indexing-compact").unwrap();
+    assert!(compact.origin.x >= px(0.) && compact.right() <= px(900.));
+    assert!(compact.origin.y >= px(0.) && compact.bottom() <= px(600.));
+    let preview = cx.debug_bounds("scan-preview").unwrap();
+    assert!(preview.size.height > px(50.), "{preview:?}");
+    assert!(preview.bottom() <= compact.origin.y, "{preview:?}");
+}
+
+#[gpui_kit::test]
+fn startup_chooser_never_scans_before_explicit_acceptance(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    draw(cx);
+    assert!(cx.debug_bounds("choose-root-idle").is_some());
+    assert!(cx.debug_bounds("source-host").is_some());
+    read(&view, cx, |app| {
+        assert!(app.awaiting_root);
+        assert_eq!(app.scan_epoch, 0);
+        assert!(app.scan.is_none() && app.remote_scan.is_none());
+    });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+    press(cx, "r");
+    assert!(read(&view, cx, |app| app.volumes_open
+        && app.awaiting_root
+        && app.scan.is_none()));
+}
+
+#[gpui_kit::test]
+fn title_brand_opens_source_picker(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let brand = cx.debug_bounds("strip-brand").expect("title brand");
+    cx.simulate_click(brand.center(), gpui_kit::Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.volumes_open));
+    assert!(cx.debug_bounds("source-picker").is_some());
+}
+
+#[gpui_kit::test]
+fn entering_a_directory_scans_only_that_explicit_root(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let selected = fixture();
+    let other = fixture();
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    update(&view, cx, |app, _| {
+        app.volumes = vec![Volume {
+            point: other.path().into(),
+            device: None,
+            space: None,
+        }];
+        app.volumes_loading = false;
+    });
+    draw(cx);
+    let input = cx.debug_bounds("source-path").expect("path editor");
+    cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
+    cx.simulate_input(selected.path().to_str().unwrap());
+    assert_eq!(
+        update(&view, cx, |app, cx| app
+            .picker_path
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .value()
+            .to_string()),
+        selected.path().to_str().unwrap()
+    );
+    press(cx, "enter");
+    assert_eq!(
+        read(&view, cx, |app| app.root_path.clone()),
+        dunce::canonicalize(selected.path()).unwrap()
+    );
+    assert!(!read(&view, cx, |app| app.awaiting_root || app.volumes_open));
+    finish_scan(&view, cx);
+}
+
+#[gpui_kit::test]
+fn invalid_ssh_input_does_not_start_a_scan_or_change_the_source(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    draw(cx);
+    let input = cx.debug_bounds("source-host").expect("host editor");
+    cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
+    cx.simulate_input("invalid host");
+    press(cx, "enter");
+    read(&view, cx, |app| {
+        assert!(app.volumes_error.is_some());
+        assert!(app.remote.is_none());
+        assert!(app.scan.is_none() && app.remote_scan.is_none());
+        assert_eq!(app.scan_epoch, 0);
+    });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+}
+
+#[gpui_kit::test]
+fn switching_from_remote_to_local_clears_machine_specific_marks(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let target = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.remote = Some("old-source".into());
+        app.remote_identity = Some(disktree_core::identity::HostIdentity {
+            hostname: "old-source".into(),
+            machine_id: None,
+        });
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        assert!(!app.marks.is_empty());
+        app.volumes_open = true;
+        app.volumes_source = None;
+        app.choose_source_root(target.path().to_path_buf(), cx);
+        assert!(app.remote.is_none() && app.remote_identity.is_none());
+        assert!(app.marks.is_empty());
+        assert!(app.tree.is_none());
+    });
+    finish_scan(&view, cx);
+}
+
+#[gpui_kit::test]
+fn chooser_fits_a_small_window_at_large_interface_zoom(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let (_, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    cx.simulate_resize(gpui_kit::size(px(900.), px(600.)));
+    for rem in [16., 28.] {
+        cx.update(|window, _| window.set_rem_size(px(rem)));
+        draw(cx);
+        let bounds = cx
+            .debug_bounds("source-picker")
+            .expect("scrollable chooser");
+        assert!(bounds.size.width > px(200.), "{bounds:?}");
+        assert!(
+            bounds.origin.x >= px(0.) && bounds.right() <= px(900.),
+            "{bounds:?}"
+        );
+        assert!(
+            bounds.origin.y >= px(0.) && bounds.bottom() <= px(600.),
+            "{bounds:?}"
+        );
+    }
+}
+
+#[gpui_kit::test]
+fn editing_a_host_never_retargets_an_existing_scan(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, Disktree::open_volumes);
+    cx.run_until_parked();
+    draw(cx);
+    let before = read(&view, cx, |app| app.scan_epoch);
+    let input = cx.debug_bounds("source-host").unwrap();
+    cx.simulate_click(input.center(), gpui_kit::Modifiers::none());
+    cx.simulate_input("new-host-not-connected");
+    update(&view, cx, |app, cx| {
+        app.choose_source_root(temp.path().into(), cx);
+        assert!(app.picker_error.is_some());
+        assert!(app.remote.is_none());
+        assert_eq!(app.scan_epoch, before);
+        assert!(app.tree.is_some());
+    });
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.volumes_open));
+}
+
+#[gpui_kit::test]
+fn a_directory_error_can_be_corrected_without_reconnecting(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    cx.run_until_parked();
+    update(&view, cx, |app, cx| {
+        app.choose_source_root(PathBuf::from("relative"), cx);
+        assert!(app.picker_error.is_some());
+        assert!(app.awaiting_root);
+        app.choose_source_root(temp.path().into(), cx);
+        assert!(app.picker_error.is_none());
+        assert!(!app.awaiting_root);
+    });
+    finish_scan(&view, cx);
+}
+
+#[gpui_kit::test]
+fn stale_local_discovery_cannot_overwrite_a_new_source_error(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let (view, cx) =
+        cx.add_window_view(|_, cx| Disktree::choose(options(), 3, None, cx));
+    // The old discovery is still queued. The new host fails validation
+    // without any network connection; only its error may remain.
+    update(&view, cx, |app, cx| {
+        app.load_volume_source(Some("-invalid".into()), cx);
+    });
+    cx.run_until_parked();
+    draw(cx);
+    read(&view, cx, |app| {
+        assert_eq!(app.volumes_source.as_deref(), Some("-invalid"));
+        assert!(app.volumes_error.is_some());
+        assert!(app.volumes.is_empty());
+        assert!(app.remote.is_none());
+    });
+    update(&view, cx, |app, cx| {
+        app.close_volumes(cx);
+        assert!(!app.poll_roots_once(1, cx));
+    });
+}
+
+#[gpui_kit::test]
+fn remote_root_acceptance_never_stats_the_path_locally(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        app.volumes_open = true;
+        // An intentionally invalid SSH destination ensures acceptance cannot
+        // contact any machine. The listing is a decoded fixture, not a walk.
+        app.volumes_source = Some("-test-fixture".into());
+        app.finish_volume_listing(
+            Ok((
+                vec![Volume {
+                    point: PathBuf::from("/only-on-the-remote-host"),
+                    device: Some("/dev/remote-disk".into()),
+                    space: None,
+                }],
+                None,
+            )),
+            cx,
+        );
+    });
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        app.choose_volume(cx);
+        assert_eq!(app.remote.as_deref(), Some("-test-fixture"));
+        assert_eq!(app.root_path, PathBuf::from("/only-on-the-remote-host"));
+        assert!(app.marks.is_empty() && app.remote_identity.is_none());
+        assert!(
+            app.tree.is_none()
+                && app.scan.is_none()
+                && app.remote_scan.is_none()
+        );
+        assert!(
+            app.scan_error
+                .as_ref()
+                .is_some_and(|error| error.contains("invalid SSH"))
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn repointing_an_ssh_alias_never_reuses_old_machine_marks(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        let old = disktree_core::identity::HostIdentity {
+            hostname: "same-name".into(),
+            machine_id: Some("machine-a".into()),
+        };
+        app.remote = Some("stable-alias".into());
+        app.update_remote_identity(Some(old.clone()));
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        app.update_remote_identity(Some(old.clone()));
+        assert!(!app.marks.is_empty(), "same machine keeps its marks");
+        app.update_remote_identity(Some(
+            disktree_core::identity::HostIdentity {
+                hostname: old.hostname,
+                machine_id: Some("machine-b".into()),
+            },
+        ));
+        assert!(app.marks.is_empty(), "same alias is not proof of identity");
+        app.toggle_mark_selected(cx);
+        assert!(!app.marks.is_empty());
+        app.update_remote_identity(None);
+        assert!(app.marks.is_empty(), "lost identity also fails closed");
+    });
+}
+
+#[gpui_kit::test]
+fn remote_review_never_deletes_even_through_direct_actions(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.remote = Some("dev".into());
+        let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        app.screen = Screen::Review;
+    });
+    draw(cx);
+    press(cx, "enter");
+    press(cx, "p");
+    press(cx, "m");
+    update(&view, cx, |app, cx| {
+        app.commit(cx);
+        app.confirm_delete(cx);
+        app.begin_removal(cx);
+        assert!(!app.confirm_open);
+        assert!(app.run.is_none());
+        assert_eq!(app.screen, Screen::Review);
+        let selection = app.plan();
+        assert_eq!(selection.targets.len(), 1);
+        assert!(selection.bytes() > 0);
+        assert_eq!(selection.reclaim(), 0);
+        assert_eq!(selection.foreign(), 0);
+        assert_eq!(selection.unattributed(), selection.bytes());
+        app.open_volumes(cx);
+        app.restart_as_administrator(cx);
+        assert!(!app.volumes_open);
+        assert!(!app.restarting);
+    });
+    draw(cx);
+    assert!(temp.path().join("junk/blob.bin").exists());
+    assert!(temp.path().join("keep/notes.txt").exists());
+}
+
+#[gpui_kit::test]
+fn a_failed_remote_scan_stops_showing_the_reading_screen(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, _| {
+        app.tree = None;
+        app.scan = None;
+        app.remote = Some("dev".into());
+        app.scan_error =
+            Some("SSH dev: Permission denied (publickey,password).".into());
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("scan-error").is_some());
+    assert!(cx.debug_bounds("scan-reading").is_none());
+}
+
+#[gpui_kit::test]
 fn the_window_draws_a_treemap_with_tiles(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
@@ -789,6 +1271,50 @@ fn the_review_screen_copies_the_list_as_an_agent_prompt(
         notice.is_some_and(|(message, _)| message.contains("copied")),
         "the copy is confirmed"
     );
+}
+
+#[gpui_kit::test]
+fn remote_review_copies_host_guarded_script_and_prompt(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.remote = Some("dev-alias".into());
+        app.remote_identity = Some(disktree_core::identity::HostIdentity {
+            hostname: "actual-server".into(),
+            machine_id: Some("abcdefabcdefabcdefabcdefabcdefab".into()),
+        });
+        app.marks.toggle(disktree_core::removal::Target {
+            path: temp.path().join("junk"),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+    press(cx, "y");
+    let script = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("script on clipboard");
+    assert!(script.contains("actual-server"));
+    assert!(script.contains("/etc/machine-id"));
+    assert!(script.contains("Wrong hostname"));
+    assert!(script.contains("ssh -T"));
+    assert!(script.contains("PREVIEW ONLY"));
+    press(cx, "a");
+    let prompt = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("prompt on clipboard");
+    assert!(prompt.contains("actual-server"));
+    assert!(prompt.contains("abcdefabcdefabcdefabcdefabcdefab"));
+    assert!(prompt.contains("MANDATORY HOST CHECK"));
+    assert!(temp.path().join("junk/blob.bin").exists());
 }
 
 /// Escape in the alert dialog cancels: the dialog closes, the review screen

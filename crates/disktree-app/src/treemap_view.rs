@@ -66,6 +66,76 @@ pub fn mosaic(
     window: &Window,
     cx: &Context<'_, Disktree>,
 ) -> impl IntoElement {
+    mosaic_inner(mosaic, app, window, cx, true)
+}
+
+/// A coarse, explicitly non-actionable picture of measured contributions.
+pub fn preview(
+    preview: &disktree_core::scan_preview::Preview,
+    app: &Disktree,
+    window: &Window,
+    cx: &Context<'_, Disktree>,
+) -> impl IntoElement {
+    use disktree_core::tree::{Node, NodeKind};
+    use disktree_core::treemap::{LayoutOptions, layout};
+    let mut root = Node::directory("preview");
+    // These are display buckets, never exposed through state.tree/path_at.
+    for entry in &preview.entries {
+        let mut node =
+            Node::entry(entry.name.as_str(), NodeKind::File, entry.bytes);
+        node.files = entry.files;
+        root.children.push(node);
+    }
+    let area = app.treemap_size.get();
+    let tiles = layout(
+        &root,
+        &[],
+        Rect::new(0., 0., area.width.as_f32(), area.height.as_f32()),
+        app.options.metric,
+        &LayoutOptions {
+            max_depth: 1,
+            max_children: 129,
+            ..LayoutOptions::default()
+        },
+    );
+    let mut mosaic = Mosaic::default();
+    for tile in tiles {
+        let Some(node) = root.resolve(tile.crumbs()) else {
+            continue;
+        };
+        mosaic.labels.push(Label {
+            text: node.name.to_string(),
+            rect: tile.rect,
+            header: None,
+            depth: 0,
+            dim: false,
+            marked: false,
+            size_text: crate::widgets::short_value(node, app.options.metric),
+        });
+        mosaic.tiles.push(TileDeco {
+            rect: tile.rect,
+            depth: 0,
+            category: Category::Other,
+            age_bucket: None,
+            reclaimable: false,
+            filtered: Filtered::Shown,
+            unreadable: false,
+            marked: false,
+            covered: false,
+            hovered: false,
+            selected: false,
+        });
+    }
+    mosaic_inner(mosaic, app, window, cx, false)
+}
+
+fn mosaic_inner(
+    mosaic: Mosaic,
+    app: &Disktree,
+    window: &Window,
+    cx: &Context<'_, Disktree>,
+    interactive: bool,
+) -> impl IntoElement {
     let theme = cx.omarchy().clone();
     let rem = window.rem_size();
     let origin = Rc::clone(&app.treemap_origin);
@@ -86,31 +156,31 @@ pub fn mosaic(
 
     div()
         .id("disktree-treemap")
-        .debug_selector(|| "treemap".into())
+        .debug_selector(move || if interactive { "treemap" } else { "scan-preview" }.into())
         .relative()
         .flex_1()
         .min_h_0()
         .min_w_0()
         .overflow_hidden()
         .bg(theme.inset)
-        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-            if !hovered {
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if interactive && !hovered {
                 this.on_mouse_leave(cx);
             }
         }))
-        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-            this.on_mouse_move(event, cx);
+        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+            if interactive { this.on_mouse_move(event, cx); }
         }))
         // One listener for every button, because the interesting ones are not
         // the three the platform names: buttons 8 and 9 arrive as
         // `MouseButton::Navigate`, and a per-button registration would have
         // to be repeated for each.
-        .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
-            this.on_mouse_down(event, cx);
+        .on_any_mouse_down(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            if interactive { this.on_mouse_down(event, cx); }
         }))
         .on_scroll_wheel(cx.listener(
-            |this, event: &ScrollWheelEvent, _, cx| {
-                this.on_scroll_wheel(event, cx);
+            move |this, event: &ScrollWheelEvent, _, cx| {
+                if interactive { this.on_scroll_wheel(event, cx); }
             },
         ))
         .child(

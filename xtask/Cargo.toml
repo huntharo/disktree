@@ -7,6 +7,9 @@ license.workspace = true
 publish = false
 description = "Check and packaging entry points for disktree: one command per gate"
 
+[dependencies]
+disktree-core.workspace = true
+
 [lints]
 workspace = true
 
