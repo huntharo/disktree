@@ -1307,6 +1307,66 @@ fn remote_review_copies_host_guarded_script_and_prompt(
     assert!(temp.path().join("junk/blob.bin").exists());
 }
 
+/// A Unix host's paths are POSIX on every client. A Windows client must not
+/// join them with `\`, split a name such as `logs\old` or `a:b`, or export a
+/// delete script that names a different file on the host.
+#[gpui_kit::test]
+fn remote_paths_keep_the_hosts_separators_on_every_client(
+    cx: &mut TestAppContext,
+) {
+    use disktree_core::tree::{Metric, Node, NodeKind, aggregate};
+
+    cx.update(gpui_omarchy::init);
+    let mut root = Node::directory("data");
+    let mut logs = Node::directory(r"logs\old");
+    logs.children
+        .push(Node::entry("a:b", NodeKind::File, 4_000));
+    root.children.push(logs);
+    root.children
+        .push(Node::entry("notes", NodeKind::File, 1_000));
+    aggregate(&mut root, Metric::Bytes);
+    let root_path = PathBuf::from("/srv/data");
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        let mut app =
+            Disktree::with_tree(root_path.clone(), root, options(), 3, cx);
+        app.remote = Some("dev".into());
+        app
+    });
+    let focus = read(&view, cx, |app| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    draw(cx);
+    update(&view, cx, |app, cx| {
+        let file = Path::new(r"/srv/data/logs\old/a:b");
+        let crumbs = app.crumbs_for_path(file).expect("one name, not two");
+        assert_eq!(app.path_at(&crumbs).as_deref(), Some(file));
+        assert!(
+            app.crumbs_for_path(Path::new("/srv/data/logs/old"))
+                .is_none()
+        );
+        app.select(Some(crumbs), cx);
+        app.toggle_mark_selected(cx);
+        assert!(app.marks.contains(file));
+        let labels: Vec<_> = app
+            .breadcrumbs()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, ["/", "srv", "data"]);
+        app.home = Some(PathBuf::from("/srv"));
+        assert_eq!(app.display_path(file), r"~/data/logs\old/a:b");
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+    press(cx, "y");
+    let script = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("script on clipboard");
+    assert!(script.contains(r"'/srv/data/logs\old/a:b'"), "{script}");
+    assert!(!script.contains(r"data\logs"), "{script}");
+}
+
 /// Escape in the alert dialog cancels: the dialog closes, the review screen
 /// stays, and nothing on disk changes.
 #[gpui_kit::test]
