@@ -434,6 +434,10 @@ fn remote_root_acceptance_never_stats_the_path_locally(
 ) {
     cx.update(init);
     let temp = fixture();
+    // Use a native absolute path so Windows reaches the remote acceptance
+    // branch too. Its absence proves local directory validation is skipped.
+    let remote_root = temp.path().join("only-on-the-remote-host");
+    assert!(remote_root.is_absolute() && !remote_root.exists());
     let (view, cx) = view_over(temp.path(), cx);
     update(&view, cx, |app, cx| {
         let crumbs = app.crumbs_for_path(&temp.path().join("junk")).unwrap();
@@ -446,7 +450,7 @@ fn remote_root_acceptance_never_stats_the_path_locally(
         app.finish_volume_listing(
             Ok((
                 vec![Volume {
-                    point: PathBuf::from("/only-on-the-remote-host"),
+                    point: remote_root.clone(),
                     device: Some("/dev/remote-disk".into()),
                     space: None,
                 }],
@@ -459,7 +463,8 @@ fn remote_root_acceptance_never_stats_the_path_locally(
     update(&view, cx, |app, cx| {
         app.choose_volume(cx);
         assert_eq!(app.remote.as_deref(), Some("-test-fixture"));
-        assert_eq!(app.root_path, PathBuf::from("/only-on-the-remote-host"));
+        assert_eq!(app.root_path, remote_root);
+        assert!(app.picker_error.is_none());
         assert!(app.marks.is_empty() && app.remote_identity.is_none());
         assert!(
             app.tree.is_none()
